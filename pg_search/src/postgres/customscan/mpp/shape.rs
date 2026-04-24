@@ -49,6 +49,8 @@
 //!
 //! [`MppPlanShape::Ineligible`] — fall back to the non-MPP serial path.
 
+use crate::scan::info::RowEstimate;
+
 /// Classify a query so the dispatcher picks the right topology.
 ///
 /// `TopKGroupByAggOnBinaryJoin` is *not* produced by [`classify`] in this
@@ -103,10 +105,7 @@ impl MppPlanShape {
 /// the smallest known estimate meets the threshold.
 ///
 /// Intended for shapes where [`MppPlanShape::is_binary_join`] returns true.
-pub fn broadcast_side_gate(
-    estimates: &[crate::scan::info::RowEstimate],
-    min_rows: i32,
-) -> Option<u64> {
+pub fn broadcast_side_gate(estimates: &[RowEstimate], min_rows: i32) -> Option<u64> {
     if min_rows <= 0 {
         return None;
     }
@@ -114,8 +113,8 @@ pub fn broadcast_side_gate(
     let smallest_known = estimates
         .iter()
         .filter_map(|e| match e {
-            crate::scan::info::RowEstimate::Known(n) => Some(*n),
-            crate::scan::info::RowEstimate::Unknown => None,
+            RowEstimate::Known(n) => Some(*n),
+            RowEstimate::Unknown => None,
         })
         .min()?;
     (smallest_known < threshold).then_some(smallest_known)
