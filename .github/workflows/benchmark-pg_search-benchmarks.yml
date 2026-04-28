@@ -242,13 +242,14 @@ jobs:
       - name: Configure PostgreSQL settings
         working-directory: /home/runner/.pgrx/data-${{ env.pg_version }}/
         run: |
-          sed -i "s/^#shared_preload_libraries = .*/shared_preload_libraries = 'pg_search'/" postgresql.conf
-          sed -i "s/^#maintenance_work_mem = .*/maintenance_work_mem = '12GB'/" postgresql.conf
-          sed -i "s/^shared_buffers = .*/shared_buffers = '12GB'/" postgresql.conf
-          sed -i "s/^#max_parallel_workers = .*/max_parallel_workers = 8/" postgresql.conf
-          sed -i "s/^#max_worker_processes = .*/max_worker_processes = 8/" postgresql.conf
-          sed -i "s/^#max_parallel_maintenance_workers = .*/max_parallel_maintenance_workers = 8/" postgresql.conf
-          sed -i "s/^#max_parallel_workers_per_gather = .*/max_parallel_workers_per_gather = 8/" postgresql.conf
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM RESET ALL;"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_search';"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET maintenance_work_mem = '12GB';"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET shared_buffers = '12GB';"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_parallel_workers = 8;"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_worker_processes = 8;"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_parallel_maintenance_workers = 8;"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_parallel_workers_per_gather = 8;"
 
       - name: Restart Postgres
         working-directory: pg_search/
