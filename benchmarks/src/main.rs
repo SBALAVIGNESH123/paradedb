@@ -75,7 +75,7 @@ struct CommonBenchmarkArgs {
     #[arg(long, default_value = "true")]
     prewarm: bool,
 
-    /// Whether to run `VACUUM ANALYZE` before executing queries.
+    /// Whether to run `VACUUM FREEZE ANALYZE` before executing queries.
     #[arg(long, default_value = "true")]
     vacuum: bool,
 
@@ -268,7 +268,7 @@ async fn run_benchmarks(args: &CommonBenchmarkArgs) -> anyhow::Result<Vec<QueryR
         .with_context(|| "Failed to connect to database")?;
 
     if args.vacuum {
-        sqlx::query("VACUUM ANALYZE")
+        sqlx::query("VACUUM FREEZE ANALYZE")
             .execute(&mut utility_conn)
             .await
             .with_context(|| "Failed to vacuum")?;
@@ -885,6 +885,12 @@ async fn execute_query_multiple_times(
     let mut conn = PgConnection::connect(url)
         .await
         .with_context(|| "Failed to connect to database")?;
+    // checkpoint before each query to make sure that the first query doesn't pay a checkpoint
+    // penalty the others dont
+    sqlx::raw_sql("CHECKPOINT;")
+        .execute(&mut conn)
+        .await
+        .with_context(|| "Failed to checkpoint before query")?;
     let mut results = Vec::new();
     let mut num_results = 0;
 
