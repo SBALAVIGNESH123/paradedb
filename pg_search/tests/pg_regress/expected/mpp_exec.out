@@ -15,6 +15,17 @@
 --   * Shape classifier agrees between path-time and plan-stash-time
 --   * `maybe_stash_mpp_plan_bytes` completes without error
 --   * The plan survives logical-plan → bytes round-trip
+--
+-- A note on EXPLAIN scope: the EXPLAINs below show the PG-level plan
+-- (the Custom Scan node is opaque from the planner's perspective). The
+-- DataFusion physical plan that the walker actually rewrites and emits
+-- is not visible here. To inspect that, set `paradedb.mpp_debug = on`
+-- and run the query at a scale that triggers parallel workers; the
+-- walker's `mpp_log!` calls render the rewritten plan to stderr. For
+-- pure plan-structure assertions there are also unit tests under
+-- `pg_search/src/postgres/customscan/mpp/walker.rs::tests::*` that
+-- build synthetic plans and assert the cut tags
+-- (`scalar_*`, `gb_*`, `tk_*`, `join_*`).
 -- =====================================================================
 CREATE EXTENSION IF NOT EXISTS pg_search;
 SET paradedb.enable_aggregate_custom_scan TO on;
@@ -118,8 +129,8 @@ WARNING:  mpp: distribute_plan walker dispatching shape=ScalarAggOnBinaryJoin to
 WARNING:  mpp: assembling ScalarAggOnBinaryJoin plan (participant=0, total=3, aggr_count=1, join_keys=1)
 WARNING:  mpp: stashed plan-broadcast bytes (shape=ScalarAggOnBinaryJoin) on AggregateScanState
 WARNING:  mpp: stashed plan-broadcast bytes (shape=ScalarAggOnBinaryJoin) on AggregateScanState
-WARNING:  mpp: AggregateScan worker 0 attached to DSM (3 participants)
 WARNING:  mpp: AggregateScan worker 1 attached to DSM (3 participants)
+WARNING:  mpp: AggregateScan worker 0 attached to DSM (3 participants)
 WARNING:  mpp: routing exec_datafusion_aggregate through shape ScalarAggOnBinaryJoin (is_leader=false)
 WARNING:  mpp: distribute_plan walker dispatching shape=ScalarAggOnBinaryJoin total=3 cuts=3
 WARNING:  mpp: routing exec_datafusion_aggregate through shape ScalarAggOnBinaryJoin (is_leader=false)
@@ -205,15 +216,15 @@ WARNING:  mpp: routing exec_datafusion_aggregate through shape GroupByAggOnBinar
 WARNING:  mpp: distribute_plan walker dispatching shape=GroupByAggOnBinaryJoin total=3 cuts=3
 WARNING:  mpp: assembling GroupByAggOnBinaryJoin plan (participant=0, total=3, aggr_count=2, group_keys=1, join_keys=1)
 WARNING:  mpp: stashed plan-broadcast bytes (shape=GroupByAggOnBinaryJoin) on AggregateScanState
-WARNING:  mpp: AggregateScan worker 1 attached to DSM (3 participants)
 WARNING:  mpp: stashed plan-broadcast bytes (shape=GroupByAggOnBinaryJoin) on AggregateScanState
+WARNING:  mpp: AggregateScan worker 1 attached to DSM (3 participants)
 WARNING:  mpp: AggregateScan worker 0 attached to DSM (3 participants)
 WARNING:  mpp: routing exec_datafusion_aggregate through shape GroupByAggOnBinaryJoin (is_leader=false)
 WARNING:  mpp: distribute_plan walker dispatching shape=GroupByAggOnBinaryJoin total=3 cuts=3
 WARNING:  mpp: routing exec_datafusion_aggregate through shape GroupByAggOnBinaryJoin (is_leader=false)
 WARNING:  mpp: distribute_plan walker dispatching shape=GroupByAggOnBinaryJoin total=3 cuts=3
-WARNING:  mpp: assembling GroupByAggOnBinaryJoin plan (participant=1, total=3, aggr_count=2, group_keys=1, join_keys=1)
 WARNING:  mpp: assembling GroupByAggOnBinaryJoin plan (participant=2, total=3, aggr_count=2, group_keys=1, join_keys=1)
+WARNING:  mpp: assembling GroupByAggOnBinaryJoin plan (participant=1, total=3, aggr_count=2, group_keys=1, join_keys=1)
   category   | cnt | max_rating 
 -------------+-----+------------
  Clothing    |  50 |          5
@@ -227,6 +238,96 @@ RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET max_parallel_workers_per_gather;
 SET paradedb.mpp_debug TO off;
+-- =====================================================================
+-- GROUP BY + ORDER BY <agg-expr> + LIMIT — the SQL pattern that the
+-- walker upgrades to the `TopKGroupByAggOnBinaryJoin` shape *when*
+-- DataFusion's physical planner fuses `Sort[fetch=k]` over the
+-- aggregate. Whether that fusion happens depends on PG's planner
+-- decisions:
+--   * On bench-scale data (e.g. `aggregate_join_topk_count - alt 2`)
+--     the Sort+Limit collapses into the AggregateScan's pushed-down
+--     plan, the walker's `extract_topk_spec` matches, and the dispatch
+--     becomes `TopKGroupByAggOnBinaryJoin` (scalar-style routing:
+--     every participant ships its Partial groups to participant 0 via
+--     `FixedTargetPartitioner(0)`, leader runs `FinalPartitioned +
+--     Sort[fetch=k]`).
+--   * In this regress fixture, PG keeps `Sort` and `Limit` above the
+--     Gather, the AggregateScan only pushes the aggregate into
+--     DataFusion, and the walker dispatches as plain
+--     `GroupByAggOnBinaryJoin`. Result is still correct because the
+--     SortExec/LimitExec live above the Gather and execute serially
+--     after MPP gathers the per-participant aggregate output.
+-- The query stays as a regression-pin for the SQL pattern (correctness
+-- under either shape); for plan-shape coverage of the TopK upgrade
+-- itself, see the synthetic-plan unit tests in
+-- `pg_search/src/postgres/customscan/mpp/walker.rs::tests::*`.
+-- =====================================================================
+SET paradedb.enable_mpp TO off;
+SELECT p.category, COUNT(*) AS cnt
+FROM mpp_exec_products p
+JOIN mpp_exec_reviews r ON p.id = r.product_id
+WHERE p.description @@@ 'laptop OR shoes OR jacket OR chair'
+GROUP BY p.category
+ORDER BY cnt DESC, p.category
+LIMIT 2;
+  category   | cnt 
+-------------+-----
+ Clothing    |  50
+ Electronics |  50
+(2 rows)
+
+SET paradedb.enable_mpp TO on;
+SET min_parallel_table_scan_size TO 0;
+SET parallel_setup_cost TO 0;
+SET parallel_tuple_cost TO 0;
+SET max_parallel_workers_per_gather TO 2;
+-- Keep mpp_debug off here so the per-worker WARNING ordering doesn't
+-- interleave non-deterministically with the EXPLAIN / SELECT output
+-- (the existing scalar + groupby blocks above already cover the
+-- mpp_debug-on case).
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT p.category, COUNT(*) AS cnt
+FROM mpp_exec_products p
+JOIN mpp_exec_reviews r ON p.id = r.product_id
+WHERE p.description @@@ 'laptop OR shoes OR jacket OR chair'
+GROUP BY p.category
+ORDER BY cnt DESC, p.category
+LIMIT 2;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Limit
+   Output: p.category, (count(*))
+   ->  Sort
+         Output: p.category, (count(*))
+         Sort Key: (count(*)) DESC, p.category
+         ->  Gather
+               Output: p.category, (count(*))
+               Workers Planned: 2
+               ->  Parallel Custom Scan (ParadeDB Aggregate Scan)
+                     Output: p.category, (count(*))
+                     Backend: DataFusion
+                     Indexes: mpp_exec_products_idx (p), mpp_exec_reviews_idx (r)
+                     Group By: category
+                     Aggregates: COUNT(*)
+(14 rows)
+
+SELECT p.category, COUNT(*) AS cnt
+FROM mpp_exec_products p
+JOIN mpp_exec_reviews r ON p.id = r.product_id
+WHERE p.description @@@ 'laptop OR shoes OR jacket OR chair'
+GROUP BY p.category
+ORDER BY cnt DESC, p.category
+LIMIT 2;
+  category   | cnt 
+-------------+-----
+ Clothing    |  50
+ Electronics |  50
+(2 rows)
+
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET max_parallel_workers_per_gather;
 -- Restore defaults + clean up.
 RESET paradedb.enable_mpp;
 RESET paradedb.mpp_worker_count;

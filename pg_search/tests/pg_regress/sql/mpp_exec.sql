@@ -15,6 +15,17 @@
 --   * Shape classifier agrees between path-time and plan-stash-time
 --   * `maybe_stash_mpp_plan_bytes` completes without error
 --   * The plan survives logical-plan → bytes round-trip
+--
+-- A note on EXPLAIN scope: the EXPLAINs below show the PG-level plan
+-- (the Custom Scan node is opaque from the planner's perspective). The
+-- DataFusion physical plan that the walker actually rewrites and emits
+-- is not visible here. To inspect that, set `paradedb.mpp_debug = on`
+-- and run the query at a scale that triggers parallel workers; the
+-- walker's `mpp_log!` calls render the rewritten plan to stderr. For
+-- pure plan-structure assertions there are also unit tests under
+-- `pg_search/src/postgres/customscan/mpp/walker.rs::tests::*` that
+-- build synthetic plans and assert the cut tags
+-- (`scalar_*`, `gb_*`, `tk_*`, `join_*`).
 -- =====================================================================
 
 CREATE EXTENSION IF NOT EXISTS pg_search;
@@ -157,6 +168,71 @@ RESET parallel_tuple_cost;
 RESET max_parallel_workers_per_gather;
 
 SET paradedb.mpp_debug TO off;
+
+-- =====================================================================
+-- GROUP BY + ORDER BY <agg-expr> + LIMIT — the SQL pattern that the
+-- walker upgrades to the `TopKGroupByAggOnBinaryJoin` shape *when*
+-- DataFusion's physical planner fuses `Sort[fetch=k]` over the
+-- aggregate. Whether that fusion happens depends on PG's planner
+-- decisions:
+--   * On bench-scale data (e.g. `aggregate_join_topk_count - alt 2`)
+--     the Sort+Limit collapses into the AggregateScan's pushed-down
+--     plan, the walker's `extract_topk_spec` matches, and the dispatch
+--     becomes `TopKGroupByAggOnBinaryJoin` (scalar-style routing:
+--     every participant ships its Partial groups to participant 0 via
+--     `FixedTargetPartitioner(0)`, leader runs `FinalPartitioned +
+--     Sort[fetch=k]`).
+--   * In this regress fixture, PG keeps `Sort` and `Limit` above the
+--     Gather, the AggregateScan only pushes the aggregate into
+--     DataFusion, and the walker dispatches as plain
+--     `GroupByAggOnBinaryJoin`. Result is still correct because the
+--     SortExec/LimitExec live above the Gather and execute serially
+--     after MPP gathers the per-participant aggregate output.
+-- The query stays as a regression-pin for the SQL pattern (correctness
+-- under either shape); for plan-shape coverage of the TopK upgrade
+-- itself, see the synthetic-plan unit tests in
+-- `pg_search/src/postgres/customscan/mpp/walker.rs::tests::*`.
+-- =====================================================================
+SET paradedb.enable_mpp TO off;
+SELECT p.category, COUNT(*) AS cnt
+FROM mpp_exec_products p
+JOIN mpp_exec_reviews r ON p.id = r.product_id
+WHERE p.description @@@ 'laptop OR shoes OR jacket OR chair'
+GROUP BY p.category
+ORDER BY cnt DESC, p.category
+LIMIT 2;
+
+SET paradedb.enable_mpp TO on;
+SET min_parallel_table_scan_size TO 0;
+SET parallel_setup_cost TO 0;
+SET parallel_tuple_cost TO 0;
+SET max_parallel_workers_per_gather TO 2;
+
+-- Keep mpp_debug off here so the per-worker WARNING ordering doesn't
+-- interleave non-deterministically with the EXPLAIN / SELECT output
+-- (the existing scalar + groupby blocks above already cover the
+-- mpp_debug-on case).
+EXPLAIN (COSTS OFF, VERBOSE, TIMING OFF)
+SELECT p.category, COUNT(*) AS cnt
+FROM mpp_exec_products p
+JOIN mpp_exec_reviews r ON p.id = r.product_id
+WHERE p.description @@@ 'laptop OR shoes OR jacket OR chair'
+GROUP BY p.category
+ORDER BY cnt DESC, p.category
+LIMIT 2;
+
+SELECT p.category, COUNT(*) AS cnt
+FROM mpp_exec_products p
+JOIN mpp_exec_reviews r ON p.id = r.product_id
+WHERE p.description @@@ 'laptop OR shoes OR jacket OR chair'
+GROUP BY p.category
+ORDER BY cnt DESC, p.category
+LIMIT 2;
+
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET max_parallel_workers_per_gather;
 
 -- Restore defaults + clean up.
 RESET paradedb.enable_mpp;
