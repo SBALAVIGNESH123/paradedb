@@ -233,30 +233,35 @@ async fn process_index_creation(
             .with_context(|| "Failed to execute index creation SQL")?;
         let duration_min_ms = start.elapsed().as_secs_f64() / 60.0;
 
-        let index_name = extract_index_name(&statement).to_owned();
+        if statement.trim().starts_with("CREATE") {
+            let index_name = extract_index_name(&statement).to_owned();
 
-        let row = sqlx::query(&format!(
-            "SELECT pg_relation_size('{index_name}') / (1024 * 1024)"
-        ))
-        .fetch_one(&mut conn)
-        .await
-        .with_context(|| "Failed to get index size")?;
-        let index_size: i64 = row.get(0);
+            let row = sqlx::query(&format!(
+                "SELECT pg_relation_size('{index_name}') / (1024 * 1024)"
+            ))
+            .fetch_one(&mut conn)
+            .await
+            .with_context(|| "Failed to get index size")?;
+            let index_size: i64 = row.get(0);
 
-        let row = sqlx::query(&format!(
-            "SELECT count(*) FROM paradedb.index_info('{index_name}')"
-        ))
-        .fetch_one(&mut conn)
-        .await
-        .with_context(|| "Failed to get segment count")?;
-        let segment_count: i64 = row.get(0);
+            let row = sqlx::query(&format!(
+                "SELECT count(*) FROM paradedb.index_info('{index_name}')"
+            ))
+            .fetch_one(&mut conn)
+            .await
+            .with_context(|| "Failed to get segment count")?;
+            let segment_count: i64 = row.get(0);
 
-        results.push(IndexCreationResult {
-            duration_min_ms,
-            index_name,
-            index_size,
-            segment_count,
-        });
+            println!(
+          "Index built: {index_name} size={index_size}MB segments={segment_count} build_time={duration_min_ms:.2}min"
+        );
+            results.push(IndexCreationResult {
+                duration_min_ms,
+                index_name,
+                index_size,
+                segment_count,
+            });
+        }
     }
 
     Ok(results)
@@ -359,10 +364,12 @@ async fn generate_markdown_output(
 async fn generate_csv_output(args: &CommonBenchmarkArgs, rows_display: &str) -> anyhow::Result<()> {
     write_test_info_csv(args, rows_display).await?;
     write_postgres_settings_csv(&args.url, &args.r#type).await?;
-    if !args.skip_setup {
-        process_index_creation_csv(args).await?;
+    for _ in 0..10 {
+        if !args.skip_setup {
+            process_index_creation_csv(args).await?;
+        }
+        run_benchmarks_csv(args).await?;
     }
-    run_benchmarks_csv(args).await?;
     Ok(())
 }
 
