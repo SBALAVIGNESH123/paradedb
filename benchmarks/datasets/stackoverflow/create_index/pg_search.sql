@@ -1,3 +1,6 @@
+DROP INDEX IF EXISTS stackoverflow_posts_idx;
+DROP INDEX IF EXISTS badges_idx;
+
 CREATE INDEX stackoverflow_posts_idx ON stackoverflow_posts 
 USING bm25 (
     id,

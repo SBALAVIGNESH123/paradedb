@@ -347,10 +347,12 @@ async fn generate_markdown_output(
     write_benchmark_header(&mut file)?;
     write_test_info(&mut file, args, rows_display).await?;
     write_postgres_settings(&mut file, &args.url).await?;
-    if !args.skip_setup {
-        process_index_creation_md(&mut file, args).await?;
+    for _ in 0..10 {
+        if !args.skip_setup {
+            process_index_creation_md(&mut file, args).await?;
+        }
+        run_benchmarks_md(&mut file, args).await?;
     }
-    run_benchmarks_md(&mut file, args).await?;
     Ok(())
 }
 
