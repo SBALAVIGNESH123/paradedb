@@ -377,10 +377,12 @@ async fn generate_json_output(
     args: &CommonBenchmarkArgs,
     _rows_display: &str,
 ) -> anyhow::Result<()> {
-    if !args.skip_setup {
-        process_index_creation_json(args).await?;
+    for _ in 0..10 {
+        if !args.skip_setup {
+            process_index_creation_json(args).await?;
+        }
+        run_benchmarks_json(args).await?;
     }
-    run_benchmarks_json(args).await?;
     Ok(())
 }
 
