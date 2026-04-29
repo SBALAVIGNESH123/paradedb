@@ -1673,9 +1673,21 @@ impl CustomScan for JoinScan {
                         mpp_state.is_leader()
                     );
                     let _guard = runtime.enter();
+                    let standard_fallback = Arc::clone(&standard_plan);
                     match distribute_plan(standard_plan, mpp_state, shape) {
                         Ok(p) => p,
-                        Err(e) => panic!("mpp: JoinScan distribute_plan failed: {e}"),
+                        Err(e) => {
+                            // Same fallback policy as AggregateScan's
+                            // dispatcher: an unsupported plan shape
+                            // (TopK, Sort + Limit, etc.) drops to the
+                            // serial DataFusion plan rather than
+                            // aborting the query.
+                            pgrx::warning!(
+                                "mpp: JoinScan distribute_plan failed ({e}); \
+                                 running serial DataFusion plan"
+                            );
+                            standard_fallback
+                        }
                     }
                 } else {
                     standard_plan

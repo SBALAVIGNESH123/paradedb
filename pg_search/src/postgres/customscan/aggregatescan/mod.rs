@@ -1471,9 +1471,20 @@ impl AggregateScan {
                     mpp_state.is_leader()
                 );
                 let _guard = runtime.enter();
+                let standard_fallback = Arc::clone(&standard_plan);
                 match distribute_plan(standard_plan, mpp_state, shape) {
                     Ok(p) => p,
-                    Err(e) => pgrx::error!("mpp: distribute_plan failed: {e}"),
+                    Err(e) => {
+                        // The dispatcher couldn't handle this plan shape
+                        // (e.g. TopK / Sort + Limit above the agg). Fall
+                        // back to the un-rewritten standard plan rather
+                        // than aborting; the query still runs, just
+                        // without MPP acceleration.
+                        pgrx::warning!(
+                            "mpp: distribute_plan failed ({e}); running serial DataFusion plan"
+                        );
+                        standard_fallback
+                    }
                 }
             } else {
                 standard_plan
