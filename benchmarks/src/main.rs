@@ -906,7 +906,7 @@ async fn execute_query_multiple_times(
     let mut results = Vec::new();
     let mut num_results = 0;
 
-    let stats_query = "SELECT max_exec_time, max_plan_time, rows FROM pg_stat_statements WHERE query LIKE 'SELECT%';";
+    let stats_query = "SELECT max_exec_time, max_plan_time, rows FROM pg_stat_statements WHERE query LIKE 'SELECT%' AND query NOT LIKE '%pg_stat_statements%';";
     let reset_query = "SELECT pg_stat_statements_reset();";
     for i in 0..times {
         sqlx::raw_sql(reset_query).execute(&mut conn).await?;

@@ -268,7 +268,7 @@ jobs:
           cargo pgrx stop pg${{ env.pg_version }}
           cargo pgrx start pg${{ env.pg_version }}
 
-      - name: Setup pg_stat_statements
+      - name: Install pg_stat_statements
         working-directory: /home/runner/.pgrx/data-${{ env.pg_version }}/
         run: |
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "CREATE EXTENSION pg_stat_statements;"
@@ -277,7 +277,9 @@ jobs:
 
       - name: Install pg_search
         working-directory: pg_search/
-        run: psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "CREATE EXTENSION IF NOT EXISTS pg_search;"
+        run: |
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "CREATE EXTENSION IF NOT EXISTS pg_search;"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET paradedb.target_segment_count = 8";
 
       - name: Benchmark "stackoverflow" Dataset (1M)
         if: >-
