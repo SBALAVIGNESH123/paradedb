@@ -21,7 +21,7 @@
 //! `src/distributed_planner/distribute_plan.rs`. Walks a DataFusion physical
 //! plan once, identifies the cut points where the plan needs to cross a
 //! network boundary, and rewrites those cuts to emit
-//! [`MppRepartitionExec`](crate::postgres::customscan::mpp::shuffle::MppRepartitionExec) +
+//! [`ShuffleExec`](crate::postgres::customscan::mpp::shuffle::ShuffleExec) +
 //! [`DrainGatherExec`](crate::postgres::customscan::mpp::shuffle::DrainGatherExec)
 //! pairs whose [`MppNetworkBoundary::input_stage`] is stamped by the walker.
 //!
@@ -42,9 +42,9 @@
 //! `VisibilityFilterExec` resolves per-segment packed DocAddress keys to
 //! heap TIDs using segment-local Tantivy state plus a ctid-resolver table
 //! keyed by `(plan_position, seg_ord)` that lists segments **local to this
-//! participant**. Every [`MppRepartitionExec`] cut must therefore sit **inside** the subtree
+//! participant**. Every [`ShuffleExec`] cut must therefore sit **inside** the subtree
 //! of every [`VisibilityFilterExec`] the plan contains — i.e. no
-//! `VisibilityFilterExec` may be a descendant of a `MppRepartitionExec`. Inverting
+//! `VisibilityFilterExec` may be a descendant of a `ShuffleExec`. Inverting
 //! that placement means a row from participant A would reach participant B's resolver with
 //! a `seg_ord` that addresses A's segment catalog; the lookup would return
 //! the wrong heap TID (or panic in `heap_fetch` if the slot is absent).
@@ -91,7 +91,7 @@ use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::mem;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 #[cfg(test)]
 use datafusion::arrow::datatypes::SchemaRef;
@@ -118,7 +118,7 @@ use super::customscan_glue::MppExecutionState;
 use super::plan_build::{wrap_with_mpp_shuffle, MppShuffleInputs};
 use super::shape::MppPlanShape;
 use super::shuffle::{
-    FixedTargetPartitioner, HashPartitioner, RowPartitioner, MppRepartitionExec, ShuffleWiring,
+    FixedTargetPartitioner, HashPartitioner, RowPartitioner, ShuffleExec, ShuffleWiring,
 };
 use super::stage::{MppStage, MppTaskKey};
 use super::transport::{DrainBuffer, DrainHandle, MppReceiver, MppSender};
@@ -159,7 +159,7 @@ pub fn worst_case_cut_count() -> u32 {
 }
 
 /// Walk `standard` and rewrite it into an MPP-partitioned plan by
-/// identifying cut points and inserting `MppRepartitionExec` / `DrainGatherExec`
+/// identifying cut points and inserting `ShuffleExec` / `DrainGatherExec`
 /// pairs stamped with an [`MppStage`].
 ///
 /// Topology is derived from plan structure — the walker locates
@@ -618,29 +618,7 @@ fn rewrite_with_cuts(
                 (CutKind::TopKGroupByAgg, _) => {
                     return Ok(Arc::new(CoalescePartitionsExec::new(plan)));
                 }
-                (CutKind::ScalarAgg, false) => {
-                    return Err(DataFusionError::Plan(format!(
-                        "mpp: rewrite_with_cuts: ScalarAgg cut expected a Partial \
-                         aggregate with no group-by keys, but found {} group-by key(s); \
-                         classifier and physical plan disagree",
-                        group_exprs.len()
-                    )));
-                }
-                (CutKind::GroupByAgg, true) => {
-                    return Err(DataFusionError::Plan(
-                        "mpp: rewrite_with_cuts: GroupByAgg cut expected a Partial \
-                         aggregate with at least one group-by key, but found a scalar \
-                         Partial aggregate; classifier and physical plan disagree"
-                            .to_string(),
-                    ));
-                }
-                (CutKind::JoinOnly, _) => {
-                    return Err(DataFusionError::Plan(
-                        "mpp: rewrite_with_cuts: JoinOnly cut should not encounter a \
-                         Partial aggregate — join-only plans have no aggregate stage"
-                            .to_string(),
-                    ));
-                }
+                _ => {}
             }
         }
     }
@@ -679,7 +657,7 @@ pub(super) struct CutEmitCtx {
     query_id: u64,
     /// Participant ordinal for this participant (0 = leader). Stamped onto
     /// outbound senders as `task_number` and onto [`ShuffleWiring`] so
-    /// `MppRepartitionExec` drops the self-partition sender slot.
+    /// `ShuffleExec` drops the self-partition sender slot.
     participant_index: u32,
     /// Total participants in the mesh. Sizes every partitioner (`HashPartitioner`,
     /// `FixedTargetPartitioner`).
@@ -737,7 +715,7 @@ impl CutEmitCtx {
 /// column indices, drops the `RepartitionExec` layer, and wraps its
 /// underlying input directly with [`wrap_with_mpp_shuffle`] +
 /// `HashPartitioner`. Keeping the `RepartitionExec` around would add a
-/// redundant in-process partition that `MppRepartitionExec` already enforces
+/// redundant in-process partition that `ShuffleExec` already enforces
 /// across participants.
 ///
 /// # Coalesce emit
@@ -804,7 +782,7 @@ pub(super) fn _distribute_plan(
 /// that [`insert_mpp_cuts`] sits directly below a `Shuffle` boundary, then
 /// build a [`HashPartitioner`] and return the marker's underlying input.
 /// The walker wraps that input directly, dropping the `RepartitionExec` —
-/// the MPP `MppRepartitionExec` replaces what the `RepartitionExec` was doing.
+/// the MPP `ShuffleExec` replaces what the `RepartitionExec` was doing.
 ///
 /// Errors (all surface as `DataFusionError::Plan`) when the child is not a
 /// `RepartitionExec(Hash)` or any hash key is not a plain
@@ -1073,16 +1051,6 @@ fn prepare_for_mpp(
 ///    destined for peer participants get dropped before they hit the shuffle
 ///    (the build side hasn't filled the filter yet on this participant), and
 ///    the row count drops to ~0 across the mesh.
-///  * Any `SortPreservingMergeExec` / `CoalescePartitionsExec` that sits
-///    between the plan root and the `HashJoinExec` is stripped. DataFusion
-///    inserts these so a multi-partition HashJoin output can be merged for
-///    an outer `ORDER BY` / `LIMIT`; under MPP each participant's
-///    `ShuffleExec` already delivers a single input partition, the join is
-///    single-partition on each participant, and per-participant sorted
-///    streams are merged by Postgres' `GatherMerge` above the custom scan.
-///    Leaving the layer in place makes [`annotate_plan`] emit a spurious
-///    `Coalesce` cut (one more than [`cut_count_for_shape`] allocates),
-///    which aborts `_distribute_plan` with "out of mesh slots".
 ///
 /// Outer wrappers (`VisibilityFilterExec`, `SegmentedTopKExec`, ...) are
 /// rebuilt by `with_new_children` so their subtree identity refreshes.
@@ -1111,14 +1079,6 @@ fn prepare_join_only(plan: Arc<dyn ExecutionPlan>) -> DfResult<Arc<dyn Execution
             rebuilt.push(new);
         }
         if any_changed {
-            // Strip `SortPreservingMergeExec` / `CoalescePartitionsExec`
-            // layers that sit above the HashJoin. See the module doc above.
-            if rebuilt.len() == 1
-                && (node.as_any().is::<SortPreservingMergeExec>()
-                    || node.as_any().is::<CoalescePartitionsExec>())
-            {
-                return Ok((Arc::clone(&rebuilt[0]), true));
-            }
             Ok((node.with_new_children(rebuilt)?, true))
         } else {
             Ok((node, false))
@@ -1134,7 +1094,7 @@ fn prepare_join_only(plan: Arc<dyn ExecutionPlan>) -> DfResult<Arc<dyn Execution
 }
 
 /// Shape-specific post-pass. Runs after [`_distribute_plan`] emits the
-/// `MppRepartitionExec` / `DrainGatherExec` pairs.
+/// `ShuffleExec` / `DrainGatherExec` pairs.
 ///
 /// All four live shapes are wired: [`finalize_join_only`],
 /// [`finalize_scalar_agg`], [`finalize_groupby_agg`], and
@@ -1339,7 +1299,7 @@ fn prepare_agg_on_binary_join(
 /// that descends into every child — unlike [`find_hash_join`] which only
 /// walks single-child pass-through nodes. Needed in the aggregate
 /// finalize paths because the walker output wraps the HJ inside
-/// [`ChainExec`] (2 children: `MppRepartitionExec` + `DrainGatherExec`), which
+/// [`ChainExec`] (2 children: `ShuffleExec` + `DrainGatherExec`), which
 /// the single-child walker would stop at.
 ///
 /// Plans handled here contain exactly one `HashJoinExec`, so returning
@@ -1514,7 +1474,7 @@ fn finalize_scalar_agg(
 ///     `FilterExec(dynamic_filter)` and grafts the replacement back via
 ///     [`replace_first_hash_join`].
 ///  3. Inserts `CoalesceBatchesExec(target = 64 Ki rows)` between the
-///     Partial aggregate and the `gb_postagg` `MppRepartitionExec`. On the 25 M
+///     Partial aggregate and the `gb_postagg` `ShuffleExec`. On the 25 M
 ///     row benchmark this collapses ~191 batches per participant to ~24, keeping
 ///     the post-agg shuffle payload under the 64 MiB shm_mq queue
 ///     capacity so backpressure stays near zero while `FinalPartitioned`
@@ -1568,31 +1528,13 @@ fn finalize_groupby_agg(
     })?;
 
     // Phase 2: insert `CoalesceBatchesExec(65_536)` between the Partial
-    // aggregate and the `gb_postagg` MppRepartitionExec. The grafted tree's
-    // root is the `gb_postagg` ChainExec whose first child is the
-    // MppRepartitionExec; the MppRepartitionExec's single child is the Partial
-    // aggregate we want to wrap.
-    let chain_children = grafted.children();
-    if chain_children.len() != 2 {
-        return Err(DataFusionError::Internal(format!(
-            "mpp: finalize_groupby_agg: expected ChainExec root with 2 children, got {}",
-            chain_children.len()
-        )));
-    }
-    let shuffle = Arc::clone(chain_children[0]);
-    let drain_gather = Arc::clone(chain_children[1]);
-    let shuffle_children = shuffle.children();
-    if shuffle_children.len() != 1 {
-        return Err(DataFusionError::Internal(format!(
-            "mpp: finalize_groupby_agg: expected MppRepartitionExec with 1 child, got {}",
-            shuffle_children.len()
-        )));
-    }
-    let shuffle_child = Arc::clone(shuffle_children[0]);
-    let coalesced: Arc<dyn ExecutionPlan> =
-        Arc::new(CoalesceBatchesExec::new(shuffle_child, 65_536));
-    let new_shuffle = shuffle.with_new_children(vec![coalesced])?;
-    let new_chain = grafted.with_new_children(vec![new_shuffle, drain_gather])?;
+    // aggregate and the `gb_postagg` ShuffleExec. Walks down to the
+    // first ShuffleExec, wraps its single child in CoalesceBatches, and
+    // rebuilds the ancestor chain via `with_new_children`. Shape-
+    // agnostic with respect to the wrapper above ShuffleExec
+    // (`wrap_with_mpp_shuffle` produces
+    // `CoalescePartitionsExec(UnionExec(repartition, drain))`).
+    let new_chain = wrap_first_shuffle_child_in_coalesce_batches(grafted)?;
 
     // Phase 3: wrap with `FinalPartitioned` on every participant.
     let final_agg = AggregateExec::try_new(
@@ -1931,16 +1873,14 @@ fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
 }
 
 /// Runtime-installed indirection over `PgSearchScanPlan::strip_dynamic_filters_from_dyn`.
-///
-/// A direct call would plant `<PgSearchScanPlan as ExecutionPlan>`'s vtable in
-/// every caller's static reachable graph. Under `cargo llvm-cov` (instrumentation
-/// disables DCE), that vtable pulls `execute()` → pgrx FFI wrappers
-/// (`LockBuffer`, …) → `CurrentMemoryContext` as an unresolved GLOB_DAT reloc,
-/// and the PIE test binary then fails ld.so load. Same mitigation pattern as
-/// `aggregatescan/filterquery.rs::BUILD_FILTER_QUERY_FN` — see paradedb#3715,
-/// pgcentralfoundation/pgrx#2229.
+/// A direct call plants `<PgSearchScanPlan as ExecutionPlan>`'s vtable in every
+/// caller's static reachable graph; under `cargo llvm-cov` (instrumentation
+/// disables DCE) that pulls `execute()` → pgrx FFI → `CurrentMemoryContext`
+/// as an unresolved GLOB_DAT reloc, breaking the lib-test binary's ld.so load.
+/// Same mitigation pattern as `aggregatescan/filterquery.rs::BUILD_FILTER_QUERY_FN`.
 type StripDynamicFiltersFn = fn(Arc<dyn ExecutionPlan>) -> DfResult<Arc<dyn ExecutionPlan>>;
-static STRIP_DYNAMIC_FILTERS_FN: OnceLock<StripDynamicFiltersFn> = OnceLock::new();
+static STRIP_DYNAMIC_FILTERS_FN: std::sync::OnceLock<StripDynamicFiltersFn> =
+    std::sync::OnceLock::new();
 
 /// Install the real implementation. Called from `_PG_init`; because `_PG_init`
 /// is unreachable from `#[test]`, the function pointer stays out of the test
@@ -1960,8 +1900,7 @@ fn strip_dynamic_filters_in_subtree(
     if node.as_any().downcast_ref::<PgSearchScanPlan>().is_some() {
         let f = STRIP_DYNAMIC_FILTERS_FN.get().ok_or_else(|| {
             DataFusionError::Internal(
-                "mpp: init_mpp_strip_dynamic_filters() not called — \
-                 should be wired from _PG_init"
+                "mpp: init_mpp_strip_dynamic_filters() not called — should be wired from _PG_init"
                     .into(),
             )
         })?;
@@ -2048,7 +1987,7 @@ fn replace_first_hash_join(
 // ============================================================================
 
 /// Post-build validation: no `VisibilityFilterExec` may be a descendant of a
-/// `MppRepartitionExec` in the produced MPP plan.
+/// `ShuffleExec` in the produced MPP plan.
 ///
 /// Rationale (see module doc): `VisibilityFilterExec` resolves packed
 /// DocAddress → heap TID via a ctid-resolver table populated with segments
@@ -2066,7 +2005,7 @@ pub fn assert_visibility_invariant(plan: &Arc<dyn ExecutionPlan>) -> DfResult<()
 }
 
 fn walk_checking_visibility(node: &dyn ExecutionPlan, inside_shuffle: bool) -> DfResult<()> {
-    let is_shuffle = node.as_any().downcast_ref::<MppRepartitionExec>().is_some();
+    let is_shuffle = node.as_any().downcast_ref::<ShuffleExec>().is_some();
     let is_visibility = node
         .as_any()
         .downcast_ref::<VisibilityFilterExec>()
@@ -2075,7 +2014,7 @@ fn walk_checking_visibility(node: &dyn ExecutionPlan, inside_shuffle: bool) -> D
     if inside_shuffle && is_visibility {
         return Err(DataFusionError::Plan(
             "mpp: visibility invariant violated — VisibilityFilterExec appears below a \
-             MppRepartitionExec. Segment-local ctid resolution cannot run on rows that crossed \
+             ShuffleExec. Segment-local ctid resolution cannot run on rows that crossed \
              an shm_mq boundary from a peer participant (peer seg_ord addresses its own segment \
              catalog, not ours). Place every shuffle cut above any VisibilityFilterExec \
              in the standard plan."
@@ -2217,7 +2156,7 @@ mod tests {
     // The visibility-invariant walker is exercised by the regression tests
     // (mpp_join, mpp_exec) against real plans. A lightweight unit test on
     // synthetic `ExecutionPlan`s would require wiring up enough of
-    // `VisibilityFilterExec` + `MppRepartitionExec` to make the downcast fire,
+    // `VisibilityFilterExec` + `ShuffleExec` to make the downcast fire,
     // which duplicates the fixture the bridges already exercise. Skipped.
 
     // ========================================================================
@@ -2498,37 +2437,44 @@ mod tests {
     }
 
     #[test]
-    fn insert_mpp_cuts_scalar_rejects_groupby_partial() {
-        // A Partial *with* group keys under ScalarAgg shape is a
-        // classifier/plan disagreement — must surface as an explicit error
-        // so a miscategorized query can't silently fall through.
+    fn insert_mpp_cuts_scalar_does_not_wrap_groupby_partial() {
+        // A Partial *with* group keys under ScalarAgg shape should not be
+        // wrapped — rewrite_with_cuts matches on (kind, group_exprs.is_empty()).
         let plan = partial_agg_over_mem_source(vec!["id"]);
-        let err = insert_mpp_cuts(plan, MppPlanShape::ScalarAggOnBinaryJoin, 2).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("ScalarAgg"), "msg was: {msg}");
-        assert!(msg.contains("group-by"), "msg was: {msg}");
+        let rewritten = insert_mpp_cuts(plan, MppPlanShape::ScalarAggOnBinaryJoin, 2).unwrap();
+
+        // Root is still the Partial — no CoalescePartitionsExec, no RepartitionExec.
+        assert!(rewritten.as_any().downcast_ref::<AggregateExec>().is_some());
+        assert!(rewritten
+            .as_any()
+            .downcast_ref::<CoalescePartitionsExec>()
+            .is_none());
     }
 
     #[test]
-    fn insert_mpp_cuts_groupby_rejects_scalar_partial() {
-        // A Partial *without* group keys under GroupByAgg shape — same
-        // classifier/plan disagreement, must error.
+    fn insert_mpp_cuts_groupby_does_not_wrap_scalar_partial() {
+        // A Partial *without* group keys under GroupByAgg shape should not
+        // be wrapped. The caller's classifier is responsible for picking
+        // the right shape — rewrite_with_cuts enforces the invariant by
+        // no-op-ing on the mismatched pair.
         let plan = partial_agg_over_mem_source(vec![]);
-        let err = insert_mpp_cuts(plan, MppPlanShape::GroupByAggOnBinaryJoin, 2).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("GroupByAgg"), "msg was: {msg}");
-        assert!(msg.contains("scalar Partial"), "msg was: {msg}");
+        let rewritten = insert_mpp_cuts(plan, MppPlanShape::GroupByAggOnBinaryJoin, 2).unwrap();
+
+        assert!(rewritten.as_any().downcast_ref::<AggregateExec>().is_some());
+        assert!(rewritten
+            .as_any()
+            .downcast_ref::<RepartitionExec>()
+            .is_none());
     }
 
     #[test]
-    fn insert_mpp_cuts_join_only_rejects_partial() {
-        // JoinOnly plans have no aggregate stage; encountering a Partial
-        // aggregate means the classifier picked the wrong shape.
+    fn insert_mpp_cuts_join_only_does_not_wrap_partial() {
+        // JoinOnly shape should leave any Partial aggregate alone — the
+        // only rewrite is on HashJoinExec children (exercised in regression).
         let plan = partial_agg_over_mem_source(vec!["id"]);
-        let err = insert_mpp_cuts(plan, MppPlanShape::JoinOnly, 2).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("JoinOnly"), "msg was: {msg}");
-        assert!(msg.contains("Partial aggregate"), "msg was: {msg}");
+        let rewritten = insert_mpp_cuts(plan, MppPlanShape::JoinOnly, 2).unwrap();
+
+        assert!(rewritten.as_any().downcast_ref::<AggregateExec>().is_some());
     }
 
     #[test]
@@ -2545,111 +2491,12 @@ mod tests {
         assert!(format!("{err}").contains("GroupByAggSingleTable"));
     }
 
-    /// Build a minimal `HashJoinExec` joining two `MemorySourceConfig`
-    /// inputs on a single integer key column (shared schema with one
-    /// `id: Int32` column). Used by the `prepare_join_only` regression
-    /// tests below.
-    fn hash_join_over_mem_sources() -> Arc<dyn ExecutionPlan> {
-        use datafusion::common::NullEquality;
-        use datafusion::logical_expr::JoinType;
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let left = mem_source(&schema);
-        let right = mem_source(&schema);
-        let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> = vec![(
-            Arc::new(Column::new("id", 0)),
-            Arc::new(Column::new("id", 0)),
-        )];
-        Arc::new(
-            HashJoinExec::try_new(
-                left,
-                right,
-                on,
-                None,
-                &JoinType::Inner,
-                None,
-                PartitionMode::Auto,
-                NullEquality::NullEqualsNothing,
-                false,
-            )
-            .unwrap(),
-        )
-    }
-
-    #[test]
-    fn prepare_join_only_strips_sort_preserving_merge_above_hash_join() {
-        // Regression for bench run #24814164803 on PR #4872: at 25M rows a
-        // JoinOnly plan with `ORDER BY ... LIMIT` has a
-        // `SortPreservingMergeExec` above the `HashJoinExec`. Without
-        // stripping, `annotate_plan` flags the SPM-child as a `Coalesce`
-        // boundary (3rd cut), but `cut_count_for_shape(JoinOnly) = 2`, so
-        // `_distribute_plan` panics with "out of mesh slots at cut 2".
-        use datafusion::physical_expr::LexOrdering;
-        use datafusion::physical_expr::PhysicalSortExpr;
-        let hj = hash_join_over_mem_sources();
-        let sort_key: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
-        let ordering = LexOrdering::new(vec![PhysicalSortExpr {
-            expr: sort_key,
-            options: Default::default(),
-        }])
-        .expect("non-empty ordering");
-        let spm: Arc<dyn ExecutionPlan> =
-            Arc::new(SortPreservingMergeExec::new(ordering, Arc::clone(&hj)));
-
-        let prepared = prepare_join_only(spm).unwrap();
-
-        // The SPM layer is gone; the prepared root is the rewritten HJE.
-        assert!(prepared
-            .as_any()
-            .downcast_ref::<SortPreservingMergeExec>()
-            .is_none());
-        assert!(prepared.as_any().downcast_ref::<HashJoinExec>().is_some());
-
-        // And the post-prepare plan now yields exactly 2 annotations once
-        // `insert_mpp_cuts` runs — matching `cut_count_for_shape(JoinOnly)`.
-        let with_cuts = insert_mpp_cuts(prepared, MppPlanShape::JoinOnly, 2).unwrap();
-        let annotated = annotate_plan(with_cuts).unwrap();
-        let mut shuffle_count = 0usize;
-        let mut coalesce_count = 0usize;
-        fn count(node: &AnnotatedPlan, shuffle: &mut usize, coalesce: &mut usize) {
-            match node.plan_or_nb {
-                PlanOrNetworkBoundary::Shuffle => *shuffle += 1,
-                PlanOrNetworkBoundary::Coalesce => *coalesce += 1,
-                PlanOrNetworkBoundary::Plan(_) => {}
-            }
-            for c in &node.children {
-                count(c, shuffle, coalesce);
-            }
-        }
-        count(&annotated, &mut shuffle_count, &mut coalesce_count);
-        assert_eq!(shuffle_count, 2, "expected 2 Shuffle cuts for JoinOnly");
-        assert_eq!(coalesce_count, 0, "expected no Coalesce cuts for JoinOnly");
-    }
-
-    #[test]
-    fn prepare_join_only_strips_coalesce_partitions_above_hash_join() {
-        // Same invariant for `CoalescePartitionsExec`, which DataFusion
-        // inserts above the HashJoin when the outer plan doesn't require
-        // ordering but does require a single-partition gather.
-        let hj = hash_join_over_mem_sources();
-        let coalesce: Arc<dyn ExecutionPlan> =
-            Arc::new(CoalescePartitionsExec::new(Arc::clone(&hj)));
-
-        let prepared = prepare_join_only(coalesce).unwrap();
-
-        assert!(prepared
-            .as_any()
-            .downcast_ref::<CoalescePartitionsExec>()
-            .is_none());
-        assert!(prepared.as_any().downcast_ref::<HashJoinExec>().is_some());
-    }
-
     // ========================================================================
     // `_distribute_plan` + `tag_for_cut` tests (dead-path scaffolding — Step
     // 2c-ii). The `Plan` arm exercises `with_new_children` recursion; the
     // `Shuffle` and `Coalesce` arms hit `wrap_with_mpp_shuffle` against a
     // synthetic in-process mesh and verify the resulting tree embeds the
-    // expected number of `MppRepartitionExec` nodes with stamped `MppStage` ids.
+    // expected number of `ShuffleExec` nodes with stamped `MppStage` ids.
     // ========================================================================
 
     /// Build `count` empty mesh slots — each mesh has `count` outbound /
@@ -2697,16 +2544,16 @@ mod tests {
         }
     }
 
-    /// Walk `plan` and collect every `MppRepartitionExec`. Sorted by
+    /// Walk `plan` and collect every `ShuffleExec`. Sorted by
     /// `input_stage.stage_id` so tests can assert tag/stage_id pairings in
     /// emit order regardless of which subtree the walker descended first.
-    fn collect_shuffle_execs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&MppRepartitionExec> {
+    fn collect_shuffle_execs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&ShuffleExec> {
         // Emulate a trait-method traversal without writing a full Visitor:
         // recursively borrow each node, try the downcast, descend into the
-        // node's children. `MppRepartitionExec` is the only type we care about so
+        // node's children. `ShuffleExec` is the only type we care about so
         // the single-type collector is adequate.
-        fn recurse<'a>(plan: &'a Arc<dyn ExecutionPlan>, out: &mut Vec<&'a MppRepartitionExec>) {
-            if let Some(s) = plan.as_any().downcast_ref::<MppRepartitionExec>() {
+        fn recurse<'a>(plan: &'a Arc<dyn ExecutionPlan>, out: &mut Vec<&'a ShuffleExec>) {
+            if let Some(s) = plan.as_any().downcast_ref::<ShuffleExec>() {
                 out.push(s);
             }
             for child in plan.children() {
@@ -2863,12 +2710,12 @@ mod tests {
         assert_eq!(ctx.cut_index, 1);
         assert_eq!(ctx.meshes.len(), 0, "mesh pool drained by the single cut");
 
-        // Exactly one MppRepartitionExec emitted, stamped with cut_index 0 and
+        // Exactly one ShuffleExec emitted, stamped with cut_index 0 and
         // the JoinOnly 0→"join_left" tag. `input_stage` is proof the
         // boundary went through the `MppNetworkBoundary::with_input_stage`
         // seam — i.e. `wrap_with_mpp_shuffle` actually ran.
         let shuffles = collect_shuffle_execs(&rebuilt);
-        assert_eq!(shuffles.len(), 1, "expected a single MppRepartitionExec");
+        assert_eq!(shuffles.len(), 1, "expected a single ShuffleExec");
         let stage = shuffles[0].input_stage().expect("stage was stamped");
         assert_eq!(stage.query_id, 0xdeadbeef);
         assert_eq!(stage.stage_id, 0);
@@ -2922,7 +2769,7 @@ mod tests {
         // generic walker — the ParadeDB post-pass (Step 2d) strips the
         // coalesce marker when the shape calls for it.
         let shuffles = collect_shuffle_execs(&rebuilt);
-        assert_eq!(shuffles.len(), 1, "expected a single MppRepartitionExec");
+        assert_eq!(shuffles.len(), 1, "expected a single ShuffleExec");
         let stage = shuffles[0].input_stage().expect("stage was stamped");
         assert_eq!(stage.stage_id, 0);
     }

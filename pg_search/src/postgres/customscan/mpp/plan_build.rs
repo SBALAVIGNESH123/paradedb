@@ -41,7 +41,7 @@
 //! `ExecutionPlan` with the MPP mesh topology:
 //!
 //! ```text
-//!     inner ──── MppRepartitionExec (hash, self-partition out) ─┐
+//!     inner ──── ShuffleExec (hash, self-partition out) ─┐
 //!                                                         ├→ UnionExec
 //!                          DrainGatherExec (peer rows) ───┘
 //! ```
@@ -80,9 +80,7 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
-use crate::postgres::customscan::mpp::chain::ChainExec;
-
-use crate::postgres::customscan::mpp::shuffle::{DrainGatherExec, MppRepartitionExec, ShuffleWiring};
+use crate::postgres::customscan::mpp::shuffle::{DrainGatherExec, ShuffleExec, ShuffleWiring};
 use crate::postgres::customscan::mpp::stage::{MppNetworkBoundary, MppStage};
 use crate::postgres::customscan::mpp::transport::DrainHandle;
 
@@ -91,7 +89,7 @@ use crate::postgres::customscan::mpp::transport::DrainHandle;
 /// - `child`: the plan whose output rows should be hash-shuffled across the
 ///   mesh. Typically `Scan → Filter` for one side of a join.
 /// - `wiring`: the outbound half of this participant's mesh edge — one
-///   `MppSender` per peer participant, `None` at the self participant. `MppRepartitionExec`
+///   `MppSender` per peer participant, `None` at the self participant. `ShuffleExec`
 ///   consumes it.
 /// - `drain_handle`: the inbound half — a `DrainBuffer` whose drain thread
 ///   is reading peer-sent rows for this participant. `DrainGatherExec`
@@ -110,8 +108,8 @@ pub struct MppShuffleInputs {
     /// no control flow depends on it.
     pub tag: &'static str,
     /// Stage descriptor to stamp on both boundary nodes (the local
-    /// `MppRepartitionExec` send side and the peer-inbound `DrainGatherExec`). A
-    /// single mesh = one stage, so `MppRepartitionExec` and `DrainGatherExec` share
+    /// `ShuffleExec` send side and the peer-inbound `DrainGatherExec`). A
+    /// single mesh = one stage, so `ShuffleExec` and `DrainGatherExec` share
     /// the same `MppStage`: the walker / bridge treats them as the two halves
     /// of one cross-participant edge.
     ///
@@ -127,7 +125,7 @@ pub struct MppShuffleInputs {
 ///
 /// Output: a single-partition stream that contains
 ///   - rows of `child` that hashed to this participant (via
-///     `MppRepartitionExec` — peer-bound rows are shipped to `wiring.outbound`
+///     `ShuffleExec` — peer-bound rows are shipped to `wiring.outbound`
 ///     before being dropped from the local stream);
 ///   - rows sent by peers via shm_mq that the drain thread has read into
 ///     `drain_handle.buffer` (via `DrainGatherExec`).
@@ -158,7 +156,7 @@ pub fn wrap_with_mpp_shuffle(
     let participant_index = wiring.participant_index;
 
     // Multi-partition children (e.g. a PgSearchTableProvider scan that emits one
-    // partition per Tantivy segment) need to be coalesced first: `MppRepartitionExec`
+    // partition per Tantivy segment) need to be coalesced first: `ShuffleExec`
     // only consumes its child's partition 0, so without this every segment
     // beyond the first would be dropped silently, producing correct group
     // counts but wildly wrong per-group aggregates.
@@ -168,12 +166,12 @@ pub fn wrap_with_mpp_shuffle(
         child
     };
 
-    // Self-side: MppRepartitionExec partitions `child`'s stream by
+    // Self-side: ShuffleExec partitions `child`'s stream by
     // `wiring.partitioner`, emits the rows whose hash lands on this participant,
     // and concurrently ships rows destined for peers through `wiring.outbound`.
-    let shuffle_node = MppRepartitionExec::new(child, wiring, tag);
+    let shuffle_node = ShuffleExec::new(child, wiring, tag);
     let shuffle: Arc<dyn ExecutionPlan> = match stage {
-        // Stamp the MppRepartitionExec via the `MppNetworkBoundary` seam. The trait
+        // Stamp the ShuffleExec via the `MppNetworkBoundary` seam. The trait
         // method consumes `self.wiring` and produces a fresh `Arc`; the
         // un-stamped `shuffle_node` is dropped immediately after.
         Some(s) => MppNetworkBoundary::with_input_stage(&shuffle_node, s)?,
@@ -203,16 +201,7 @@ pub fn wrap_with_mpp_shuffle(
     // standard DF operators here lets the planner reason about a known
     // operator pair rather than a custom node.
     //
-    //  1. `MppRepartitionExec` is a leaf-driver: polling it pumps rows through the
-    //     scan → split → ship-to-peers pipeline regardless of whether our
-    //     gather side is also being polled. The drain thread (plain
-    //     `std::thread`, not a tokio task) reads peer-shipped rows into
-    //     `DrainBuffer` *concurrently* with the shuffle's poll, independent
-    //     of the operator's own polling cadence.
-    //  2. `DrainGatherExec` only blocks until its sources mark EOF. Peers'
-    //     senders drop when their own `MppRepartitionExec` children exhaust — which
-    //     happens as soon as they finish their scan, regardless of whether
-    //     we're currently reading their shipments.
+    // Correctness still relies on two structural guarantees:
     //
     //  1. `ShuffleExec` is a leaf-driver: polling it pumps rows through
     //     the scan → split → ship-to-peers pipeline regardless of which
@@ -260,7 +249,7 @@ mod tests {
     /// - self-partition rows (even IDs: 0,2,4,6,8)
     /// - peer-partition rows (synthetic IDs 100,200 from the peer)
     ///
-    /// and the outbound channel should carry the odd IDs that MppRepartitionExec
+    /// and the outbound channel should carry the odd IDs that ShuffleExec
     /// shipped away (1,3,5,7,9).
     #[test]
     fn wrap_with_mpp_shuffle_splices_self_and_peer() {
@@ -359,7 +348,7 @@ mod tests {
         // Union output: self-partition (even IDs) + peer-simulated (100, 200).
         emitted_ids.sort();
         assert_eq!(emitted_ids, vec![0, 2, 4, 6, 8, 100, 200]);
-        // Outbound: MppRepartitionExec shipped odd IDs (rows that hashed to participant 1).
+        // Outbound: ShuffleExec shipped odd IDs (rows that hashed to participant 1).
         outbound_ids.sort();
         assert_eq!(outbound_ids, vec![1, 3, 5, 7, 9]);
     }

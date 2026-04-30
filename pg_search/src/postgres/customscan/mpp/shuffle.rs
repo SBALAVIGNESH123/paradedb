@@ -418,7 +418,7 @@ impl ShuffleExec {
     }
 }
 
-impl MppNetworkBoundary for MppRepartitionExec {
+impl MppNetworkBoundary for ShuffleExec {
     fn input_stage(&self) -> Option<&MppStage> {
         self.input_stage.as_ref()
     }
@@ -426,18 +426,12 @@ impl MppNetworkBoundary for MppRepartitionExec {
     fn with_input_stage(&self, stage: MppStage) -> DFResult<Arc<dyn ExecutionPlan>> {
         let wiring = self.wiring.lock().unwrap().take().ok_or_else(|| {
             DataFusionError::Internal(
-                "MppRepartitionExec::with_input_stage: wiring already consumed".into(),
+                "ShuffleExec::with_input_stage: wiring already consumed".into(),
             )
         })?;
-        let mut node = MppRepartitionExec::new(self.input.clone(), wiring, self.tag);
+        let mut node = ShuffleExec::new(self.input.clone(), wiring, self.tag);
         node.input_stage = Some(stage);
         Ok(Arc::new(node))
-    }
-}
-
-impl DisplayAs for MppRepartitionExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MppRepartitionExec")
     }
 }
 
@@ -483,7 +477,7 @@ impl ExecutionPlan for ShuffleExec {
                 "ShuffleExec: with_new_children called after wiring was consumed".into(),
             ));
         };
-        Ok(Arc::new(MppRepartitionExec::new(
+        Ok(Arc::new(ShuffleExec::new(
             children.into_iter().next().unwrap(),
             wiring,
             self.tag,

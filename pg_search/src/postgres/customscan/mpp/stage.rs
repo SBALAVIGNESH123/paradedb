@@ -23,11 +23,13 @@
 //! In a PG parallel-worker world a "task" is a peer participant in the mesh, so
 //! `task_count` is enough — we don't need URLs or a `WorkerResolver`.
 //!
-//! This module is a P1 seam: the trait is defined and implemented on
-//! `MppRepartitionExec` / `DrainGatherExec`, but nothing inside MPP calls it yet.
-//! P3's generic cut-rule walker (ported from `distribute_plan.rs`) will be the
-//! first consumer — at that point every boundary node gets a real
-//! [`MppStage`] stamped during the walk, replacing the `None` placeholder.
+//! Live consumers: the walker (`walker::emit_shuffle_cut` ➜
+//! `plan_build::wrap_with_mpp_shuffle`) stamps an [`MppStage`] on every
+//! [`ShuffleExec`] / [`DrainGatherExec`] it emits via the
+//! [`MppNetworkBoundary::with_input_stage`] helper. The receiver-side
+//! validation that consumes the stamp lives in P5b — until then the
+//! frame-header bytes carry the `(query_id, stage_id, task_number,
+//! partition)` tuple and decoders discard it after a length check.
 
 use std::sync::Arc;
 
@@ -93,7 +95,7 @@ pub struct MppTaskKey {
 /// trait.
 ///
 /// P1 is intentionally permissive: `input_stage` returns `Option<&MppStage>`
-/// because existing call sites construct `MppRepartitionExec` / `DrainGatherExec`
+/// because existing call sites construct `ShuffleExec` / `DrainGatherExec`
 /// without a stage. P3's walker will stamp one via [`with_input_stage`] during
 /// the `transform_up` pass. Once every boundary is walker-produced we can
 /// tighten the signature to `&MppStage` and delete the `Option`.
