@@ -272,6 +272,7 @@ async fn run_benchmarks(args: &CommonBenchmarkArgs) -> anyhow::Result<Vec<QueryR
         .await
         .with_context(|| "Failed to connect to database")?;
 
+    println!("Vacuuming...");
     if args.vacuum {
         sqlx::query("VACUUM FULL ANALYZE")
             .execute(&mut utility_conn)
@@ -873,6 +874,20 @@ async fn prewarm_indexes(
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct ExplainPlan {
+    #[serde(rename = "Actual Rows")]
+    rows: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct ExplainRow {
+    #[serde(rename = "Plan")]
+    plan: ExplainPlan,
+    #[serde(rename = "Execution Time")]
+    execution_time_ms: f64,
+}
+
 /// Execute a benchmark query multiple times on a single reused connection.
 ///
 /// This creates a fresh connection for each benchmark query and then reuses it across repeated
@@ -905,16 +920,23 @@ async fn execute_query_multiple_times(
     let mut results = Vec::new();
     let mut num_results = 0;
 
+    let query_group: Vec<_> = query.split(";").collect();
+    for q in query_group[0..query_group.len() - 1].iter() {
+        sqlx::raw_sql(q).execute(&mut conn).await?;
+    }
+    let explain_query = format!(
+        "EXPLAIN (ANALYZE, FORMAT JSON) {}",
+        query_group.last().unwrap()
+    );
     for i in 0..times {
-        let start = Instant::now();
-        let result = sqlx::raw_sql(query).execute(&mut conn).await;
-        let elapsed = start.elapsed();
-
+        let result: Result<(sqlx::types::Json<Vec<ExplainRow>>,), _> =
+            sqlx::query_as(&explain_query).fetch_one(&mut conn).await;
         match result {
             Ok(r) => {
-                results.push(elapsed.as_secs_f64() * 1000.0);
+                let r = &r.0 .0[0];
+                results.push(r.execution_time_ms);
                 if i == 0 {
-                    num_results = r.rows_affected() as usize;
+                    num_results = r.plan.rows as usize;
                 }
             }
             Err(err) => {
