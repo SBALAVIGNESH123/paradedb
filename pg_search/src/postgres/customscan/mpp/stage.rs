@@ -25,7 +25,7 @@
 //!
 //! Live consumers: the walker (`walker::emit_shuffle_cut` ➜
 //! `plan_build::wrap_with_mpp_shuffle`) stamps an [`MppStage`] on every
-//! [`MppRepartitionExec`] / [`DrainGatherExec`] it emits via the
+//! [`ShuffleExec`] / [`DrainGatherExec`] it emits via the
 //! [`MppNetworkBoundary::with_input_stage`] helper. The receiver-side
 //! validation that consumes the stamp lives in P5b — until then the
 //! frame-header bytes carry the `(query_id, stage_id, task_number,
@@ -95,7 +95,7 @@ pub struct MppTaskKey {
 /// trait.
 ///
 /// P1 is intentionally permissive: `input_stage` returns `Option<&MppStage>`
-/// because existing call sites construct `MppRepartitionExec` / `DrainGatherExec`
+/// because existing call sites construct `ShuffleExec` / `DrainGatherExec`
 /// without a stage. P3's walker will stamp one via [`with_input_stage`] during
 /// the `transform_up` pass. Once every boundary is walker-produced we can
 /// tighten the signature to `&MppStage` and delete the `Option`.

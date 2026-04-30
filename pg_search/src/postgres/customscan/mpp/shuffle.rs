@@ -418,7 +418,7 @@ impl ShuffleExec {
     }
 }
 
-impl MppNetworkBoundary for MppRepartitionExec {
+impl MppNetworkBoundary for ShuffleExec {
     fn input_stage(&self) -> Option<&MppStage> {
         self.input_stage.as_ref()
     }
@@ -426,16 +426,16 @@ impl MppNetworkBoundary for MppRepartitionExec {
     fn with_input_stage(&self, stage: MppStage) -> DFResult<Arc<dyn ExecutionPlan>> {
         let wiring = self.wiring.lock().unwrap().take().ok_or_else(|| {
             DataFusionError::Internal(
-                "MppRepartitionExec::with_input_stage: wiring already consumed".into(),
+                "ShuffleExec::with_input_stage: wiring already consumed".into(),
             )
         })?;
-        let mut node = MppRepartitionExec::new(self.input.clone(), wiring, self.tag);
+        let mut node = ShuffleExec::new(self.input.clone(), wiring, self.tag);
         node.input_stage = Some(stage);
         Ok(Arc::new(node))
     }
 }
 
-impl DisplayAs for MppRepartitionExec {
+impl DisplayAs for ShuffleExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ShuffleExec")
     }
@@ -477,7 +477,7 @@ impl ExecutionPlan for ShuffleExec {
                 "ShuffleExec: with_new_children called after wiring was consumed".into(),
             ));
         };
-        Ok(Arc::new(MppRepartitionExec::new(
+        Ok(Arc::new(ShuffleExec::new(
             children.into_iter().next().unwrap(),
             wiring,
             self.tag,
@@ -827,6 +827,9 @@ pub struct DrainGatherExec {
     /// Remembered so `build_drain_gather_stream` can log which participant
     /// received.
     participant_index: u32,
+    /// Stage this boundary consumes from. P1 seam only.
+    #[allow(dead_code)]
+    input_stage: Option<MppStage>,
 }
 
 impl fmt::Debug for DrainGatherExec {
@@ -857,7 +860,30 @@ impl DrainGatherExec {
             plan_properties,
             tag,
             participant_index,
+            input_stage: None,
         }
+    }
+}
+
+impl MppNetworkBoundary for DrainGatherExec {
+    fn input_stage(&self) -> Option<&MppStage> {
+        self.input_stage.as_ref()
+    }
+
+    fn with_input_stage(&self, stage: MppStage) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let handle = self.drain_handle.lock().unwrap().take().ok_or_else(|| {
+            DataFusionError::Internal(
+                "DrainGatherExec::with_input_stage: drain handle already consumed".into(),
+            )
+        })?;
+        let mut node = DrainGatherExec::new(
+            handle,
+            self.schema.clone(),
+            self.tag,
+            self.participant_index,
+        );
+        node.input_stage = Some(stage);
+        Ok(Arc::new(node))
     }
 }
 
