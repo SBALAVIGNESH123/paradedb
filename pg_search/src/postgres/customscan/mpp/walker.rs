@@ -1848,6 +1848,33 @@ pub fn init_mpp_strip_dynamic_filters() {
     STRIP_DYNAMIC_FILTERS_FN.get_or_init(|| PgSearchScanPlan::strip_dynamic_filters_from_dyn);
 }
 
+/// Register an extractor with the `datafusion-distributed` fork so its
+/// [`NetworkBoundaryExt::as_network_boundary`] downcast chain recognizes
+/// our [`MppShuffleExec`]. Without this, the fork's idempotency check
+/// (`distribute_plan_with_factory`'s `original.exists(|p| p.is_network_boundary())`)
+/// would mis-classify our plans as boundary-free and re-run distribution,
+/// and the metrics rewriter would skip our boundaries when traversing.
+///
+/// Called from `_PG_init` alongside [`init_mpp_strip_dynamic_filters`];
+/// the registration is idempotent at the consumer level (we wrap with
+/// a `OnceLock` so repeated calls are cheap), and the fork's registry
+/// itself is append-only — first-match-wins ensures no harm even if
+/// the registration somehow fires twice.
+pub fn init_mpp_network_boundary_extractor() {
+    static REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        datafusion_distributed::register_network_boundary_extractor(extract_mpp_shuffle_exec);
+    });
+}
+
+fn extract_mpp_shuffle_exec(
+    plan: &dyn datafusion::physical_plan::ExecutionPlan,
+) -> Option<&dyn datafusion_distributed::NetworkBoundary> {
+    plan.as_any()
+        .downcast_ref::<crate::postgres::customscan::mpp::shuffle::MppShuffleExec>()
+        .map(|e| e as &dyn datafusion_distributed::NetworkBoundary)
+}
+
 /// Walk a join-input subtree and replace every `PgSearchScanPlan` with a
 /// copy whose `dynamic_filters` Vec is empty. The `FilterPushdown` physical
 /// optimizer pushed the HashJoin's dynamic-filter Arc into the probe-side
