@@ -911,7 +911,7 @@ async fn execute_query_multiple_times(
     for i in 0..times {
         sqlx::raw_sql(reset_query).execute(&mut conn).await?;
         sqlx::raw_sql(query).execute(&mut conn).await?;
-        let result: Result<(f64, f64, f64), _> =
+        let result: Result<(f64, f64, i32), _> =
             sqlx::query_as(stats_query).fetch_one(&mut conn).await;
         match result {
             Ok((exec_time, plan_time, rows)) => {
