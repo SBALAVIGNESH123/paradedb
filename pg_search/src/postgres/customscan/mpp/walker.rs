@@ -764,16 +764,19 @@ pub(super) fn _distribute_plan(
             // above). DF-D enforces this with `require_one_child`.
             let child = require_one_child(&new_children)?;
             let tag = tag_for_cut(ctx.shape, ctx.cut_index);
-            let (partitioner, underlying) =
+            let (partitioner, underlying, hash_keys) =
                 shuffle_keys_from_repartition(&child, ctx.total_participants)?;
-            emit_shuffle_cut(ctx, underlying, partitioner, tag)
+            emit_shuffle_cut(ctx, underlying, partitioner, tag, Some(hash_keys))
         }
         PlanOrNetworkBoundary::Coalesce => {
             let child = require_one_child(&new_children)?;
             let tag = tag_for_cut(ctx.shape, ctx.cut_index);
             let partitioner: Arc<dyn RowPartitioner> =
                 Arc::new(FixedTargetPartitioner::new(0, ctx.total_participants));
-            emit_shuffle_cut(ctx, child, partitioner, tag)
+            // No hash keys for the scalar-final gather — every row routes to
+            // participant 0, so there is no `Partitioning::Hash(keys, N)`
+            // shape to declare downstream.
+            emit_shuffle_cut(ctx, child, partitioner, tag, None)
         }
     }
 }
@@ -790,10 +793,22 @@ pub(super) fn _distribute_plan(
 /// case is the same constraint the legacy topology assemblers enforce via
 /// [`extract_key_col_indices`] — milestone 1 only supports column-ref join
 /// keys.
+/// Tuple returned by [`shuffle_keys_from_repartition`]: the production
+/// `RowPartitioner` (production `HashPartitioner`), the underlying
+/// `ExecutionPlan` whose rows the shuffle consumes, and the original hash-key
+/// `PhysicalExpr` list — the latter is forwarded into
+/// [`MppPartitionAdapterExec`] so the wrapped output declares
+/// `Partitioning::Hash(keys, N)` natively.
+type ShuffleEmitInputs = (
+    Arc<dyn RowPartitioner>,
+    Arc<dyn ExecutionPlan>,
+    Vec<Arc<dyn PhysicalExpr>>,
+);
+
 fn shuffle_keys_from_repartition(
     child: &Arc<dyn ExecutionPlan>,
     total_participants: u32,
-) -> DfResult<(Arc<dyn RowPartitioner>, Arc<dyn ExecutionPlan>)> {
+) -> DfResult<ShuffleEmitInputs> {
     let r_exec = child
         .as_any()
         .downcast_ref::<RepartitionExec>()
@@ -814,7 +829,7 @@ fn shuffle_keys_from_repartition(
     let keys: Vec<usize> = exprs.iter().map(col_index).collect::<DfResult<Vec<_>>>()?;
     let partitioner: Arc<dyn RowPartitioner> =
         Arc::new(HashPartitioner::new(keys, total_participants));
-    Ok((partitioner, Arc::clone(r_exec.input())))
+    Ok((partitioner, Arc::clone(r_exec.input()), exprs.clone()))
 }
 
 /// Pop the next mesh off `ctx.meshes` and stitch up the full drain + sender
@@ -831,6 +846,7 @@ fn emit_shuffle_cut(
     child: Arc<dyn ExecutionPlan>,
     partitioner: Arc<dyn RowPartitioner>,
     tag: &'static str,
+    hash_keys: Option<Vec<Arc<dyn PhysicalExpr>>>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
     let mesh = ctx.meshes.pop_front().ok_or_else(|| {
         DataFusionError::Plan(format!(
@@ -863,6 +879,7 @@ fn emit_shuffle_cut(
         wrapped_schema,
         tag,
         stage: Some(stage),
+        hash_keys,
     })
 }
 
@@ -1361,8 +1378,15 @@ fn build_partitioned_hj_with_probe_filter(hj: &HashJoinExec) -> DfResult<Arc<dyn
         None => right_shuffled,
     };
 
+    // Pin `PartitionMode::Partitioned` regardless of the inbound HJ's mode.
+    // The native-partition pivot stamps both children with
+    // `Partitioning::Hash(keys, N)` via [`MppPartitionAdapterExec`], so
+    // CollectLeft's `left_partitions == 1` assertion would fail; Partitioned
+    // is the matching join mode and aligns with the upstream
+    // `MppPlanShape::JoinOnly` finalizer.
     hj.builder()
         .with_new_children(vec![left_shuffled, right_probe])?
+        .with_partition_mode(PartitionMode::Partitioned)
         .build_exec()
 }
 
@@ -1545,7 +1569,14 @@ fn finalize_groupby_agg(
         new_chain,
         partial_schema,
     )?;
-    Ok(Arc::new(final_agg))
+
+    // Phase 4: collapse the FinalPartitioned's N output partitions back to a
+    // single stream so PG's CustomScan (which only drives `execute(0)`) sees
+    // the participant's complete output. The post-agg shuffle's
+    // [`MppPartitionAdapterExec`] declares `Partitioning::Hash(group_keys, N)`
+    // — without this gather, only partition 0's groups would surface to PG
+    // and the other N-1 participants' contributions would be dropped.
+    Ok(Arc::new(CoalescePartitionsExec::new(Arc::new(final_agg))))
 }
 
 /// Walk down `plan`, find the first `ShuffleExec`, and wrap its single

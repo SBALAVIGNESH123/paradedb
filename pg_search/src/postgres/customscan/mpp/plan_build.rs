@@ -76,10 +76,12 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
+use crate::postgres::customscan::mpp::partition_adapter::MppPartitionAdapterExec;
 use crate::postgres::customscan::mpp::shuffle::{DrainGatherExec, ShuffleExec, ShuffleWiring};
 use crate::postgres::customscan::mpp::stage::{MppNetworkBoundary, MppStage};
 use crate::postgres::customscan::mpp::transport::DrainHandle;
@@ -119,6 +121,16 @@ pub struct MppShuffleInputs {
     /// the bridges we can tighten this to a non-optional field and delete the
     /// legacy branch.
     pub stage: Option<MppStage>,
+    /// Hash-key physical exprs for the upstream `RepartitionExec(Hash)` whose
+    /// role this shuffle subsumes. When `Some`, [`wrap_with_mpp_shuffle`] caps
+    /// the topology with [`MppPartitionAdapterExec`] so the output declares
+    /// `Partitioning::Hash(keys, N)` — partition-aware DF optimizer rules
+    /// (EnforceDistribution, group-by partitioning matchers, etc.) can then
+    /// reason about the shuffle natively. When `None` (e.g. the
+    /// `FixedTargetPartitioner` scalar-final gather, where there is no
+    /// hash-key list to declare), the topology stays at
+    /// `Partitioning::UnknownPartitioning(1)` and no adapter is inserted.
+    pub hash_keys: Option<Vec<Arc<dyn PhysicalExpr>>>,
 }
 
 /// Wrap a child plan with the MPP hash-shuffle topology.
@@ -152,8 +164,10 @@ pub fn wrap_with_mpp_shuffle(
         wrapped_schema,
         tag,
         stage,
+        hash_keys,
     } = inputs;
     let participant_index = wiring.participant_index;
+    let participant_count = wiring.partitioner.total_participants();
 
     // Multi-partition children (e.g. a PgSearchTableProvider scan that emits one
     // partition per Tantivy segment) need to be coalesced first: `ShuffleExec`
@@ -212,7 +226,25 @@ pub fn wrap_with_mpp_shuffle(
     //     exhaust — independent of whether we're currently reading.
     let _ = wrapped_schema; // Schema is inferred from `shuffle` via UnionExec.
     let union = UnionExec::try_new(vec![shuffle, gather])?;
-    Ok(Arc::new(CoalescePartitionsExec::new(union)))
+    let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
+
+    // Promote to a native `Partitioning::Hash(keys, N)` declaration when the
+    // caller knows the keys. `MppPartitionAdapterExec` is a 1→N partition
+    // adapter: only `execute(participant_index)` returns rows; the other N-1
+    // partitions yield empty streams. The adapter sits above the
+    // `CoalescePartitionsExec(Union(...))` topology so `ShuffleExec` /
+    // `DrainGatherExec` need no per-partition awareness — they continue to
+    // produce the participant's full local slice, the adapter just relabels
+    // it under DF's native partition concept.
+    match hash_keys {
+        Some(keys) => Ok(Arc::new(MppPartitionAdapterExec::new(
+            coalesced,
+            keys,
+            participant_index,
+            participant_count,
+        ))),
+        None => Ok(coalesced),
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +332,7 @@ mod tests {
             wrapped_schema: schema.clone(),
             tag: "test",
             stage: None,
+            hash_keys: None,
         })
         .unwrap();
 
