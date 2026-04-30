@@ -28,7 +28,6 @@
 pub mod coordinator;
 pub mod customscan_glue;
 pub mod mesh;
-pub mod partition_adapter;
 pub mod plan_build;
 pub mod session;
 pub mod shape;

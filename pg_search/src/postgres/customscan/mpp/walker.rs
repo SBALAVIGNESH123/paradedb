@@ -118,7 +118,7 @@ use super::customscan_glue::MppExecutionState;
 use super::plan_build::{wrap_with_mpp_shuffle, MppShuffleInputs};
 use super::shape::MppPlanShape;
 use super::shuffle::{
-    FixedTargetPartitioner, HashPartitioner, RowPartitioner, ShuffleExec, ShuffleWiring,
+    FixedTargetPartitioner, HashPartitioner, MppShuffleExec, RowPartitioner, ShuffleWiring,
 };
 use super::stage::{MppStage, MppTaskKey};
 use super::transport::{DrainBuffer, DrainHandle, MppReceiver, MppSender};
@@ -766,17 +766,27 @@ pub(super) fn _distribute_plan(
             let tag = tag_for_cut(ctx.shape, ctx.cut_index);
             let (partitioner, underlying, hash_keys) =
                 shuffle_keys_from_repartition(&child, ctx.total_participants)?;
-            emit_shuffle_cut(ctx, underlying, partitioner, tag, Some(hash_keys))
+            // Hash shuffle: drive_partition is this participant's index — the
+            // partition that holds this participant's local slice of rows.
+            let drive_partition = ctx.participant_index;
+            emit_shuffle_cut(
+                ctx,
+                underlying,
+                partitioner,
+                tag,
+                Some(hash_keys),
+                drive_partition,
+            )
         }
         PlanOrNetworkBoundary::Coalesce => {
             let child = require_one_child(&new_children)?;
             let tag = tag_for_cut(ctx.shape, ctx.cut_index);
             let partitioner: Arc<dyn RowPartitioner> =
                 Arc::new(FixedTargetPartitioner::new(0, ctx.total_participants));
-            // No hash keys for the scalar-final gather — every row routes to
-            // participant 0, so there is no `Partitioning::Hash(keys, N)`
-            // shape to declare downstream.
-            emit_shuffle_cut(ctx, child, partitioner, tag, None)
+            // Fixed-target gather: drive_partition is the target (0) on every
+            // participant. No hash keys to declare — output partitioning is
+            // `UnknownPartitioning(1)` since only the target ever has rows.
+            emit_shuffle_cut(ctx, child, partitioner, tag, None, 0)
         }
     }
 }
@@ -847,6 +857,7 @@ fn emit_shuffle_cut(
     partitioner: Arc<dyn RowPartitioner>,
     tag: &'static str,
     hash_keys: Option<Vec<Arc<dyn PhysicalExpr>>>,
+    drive_partition: u32,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
     let mesh = ctx.meshes.pop_front().ok_or_else(|| {
         DataFusionError::Plan(format!(
@@ -880,6 +891,7 @@ fn emit_shuffle_cut(
         tag,
         stage: Some(stage),
         hash_keys,
+        drive_partition,
     })
 }
 
@@ -1592,7 +1604,7 @@ fn finalize_groupby_agg(
 fn wrap_first_shuffle_child_in_coalesce_batches(
     plan: Arc<dyn ExecutionPlan>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    if plan.as_any().is::<ShuffleExec>() {
+    if plan.as_any().is::<MppShuffleExec>() {
         let children = plan.children();
         if children.len() != 1 {
             return Err(DataFusionError::Internal(format!(
@@ -2036,7 +2048,7 @@ pub fn assert_visibility_invariant(plan: &Arc<dyn ExecutionPlan>) -> DfResult<()
 }
 
 fn walk_checking_visibility(node: &dyn ExecutionPlan, inside_shuffle: bool) -> DfResult<()> {
-    let is_shuffle = node.as_any().downcast_ref::<ShuffleExec>().is_some();
+    let is_shuffle = node.as_any().downcast_ref::<MppShuffleExec>().is_some();
     let is_visibility = node
         .as_any()
         .downcast_ref::<VisibilityFilterExec>()
@@ -2578,13 +2590,13 @@ mod tests {
     /// Walk `plan` and collect every `ShuffleExec`. Sorted by
     /// `input_stage.stage_id` so tests can assert tag/stage_id pairings in
     /// emit order regardless of which subtree the walker descended first.
-    fn collect_shuffle_execs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&ShuffleExec> {
+    fn collect_shuffle_execs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&MppShuffleExec> {
         // Emulate a trait-method traversal without writing a full Visitor:
         // recursively borrow each node, try the downcast, descend into the
         // node's children. `ShuffleExec` is the only type we care about so
         // the single-type collector is adequate.
-        fn recurse<'a>(plan: &'a Arc<dyn ExecutionPlan>, out: &mut Vec<&'a ShuffleExec>) {
-            if let Some(s) = plan.as_any().downcast_ref::<ShuffleExec>() {
+        fn recurse<'a>(plan: &'a Arc<dyn ExecutionPlan>, out: &mut Vec<&'a MppShuffleExec>) {
+            if let Some(s) = plan.as_any().downcast_ref::<MppShuffleExec>() {
                 out.push(s);
             }
             for child in plan.children() {

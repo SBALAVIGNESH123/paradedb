@@ -78,82 +78,60 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
-use crate::postgres::customscan::mpp::partition_adapter::MppPartitionAdapterExec;
-use crate::postgres::customscan::mpp::shuffle::{DrainGatherExec, ShuffleExec, ShuffleWiring};
+use crate::postgres::customscan::mpp::shuffle::{MppShuffleExec, ShuffleWiring};
 use crate::postgres::customscan::mpp::stage::{MppNetworkBoundary, MppStage};
 use crate::postgres::customscan::mpp::transport::DrainHandle;
 
 /// Inputs to [`wrap_with_mpp_shuffle`].
 ///
-/// - `child`: the plan whose output rows should be hash-shuffled across the
-///   mesh. Typically `Scan → Filter` for one side of a join.
-/// - `wiring`: the outbound half of this participant's mesh edge — one
-///   `MppSender` per peer participant, `None` at the self participant. `ShuffleExec`
-///   consumes it.
-/// - `drain_handle`: the inbound half — a `DrainBuffer` whose drain thread
-///   is reading peer-sent rows for this participant. `DrainGatherExec`
-///   consumes it.
-/// - `wrapped_schema`: schema of both `child.schema()` and the peer-sent
-///   Arrow IPC batches. Must be the same on both sides so `UnionExec` can
-///   splice them. Also used by `DrainGatherExec` to reject schema-drifted
-///   peer batches at decode time.
+/// - `child`: the plan whose output rows the shuffle will consume.
+/// - `wiring`: outbound half of this participant's mesh edge.
+/// - `drain_handle`: inbound half (peer-shipped rows).
+/// - `wrapped_schema`: schema both `child.schema()` and peer-sent Arrow IPC
+///   batches resolve to. Used to coalesce a multi-partition child if needed.
+/// - `tag`: diagnostic label used in `mpp_log!` row-count reports.
+/// - `stage`: stage descriptor stamped onto the emitted [`MppShuffleExec`].
+/// - `hash_keys`: when `Some(keys)`, the shuffle declares
+///   `Partitioning::Hash(keys, N)` natively. When `None`, output is
+///   `UnknownPartitioning(1)` (the scalar-final gather case).
+/// - `drive_partition`: the output partition that performs the producer +
+///   drain work on this participant. For hash shuffles this is
+///   `participant_index`; for fixed-target gathers it is the target on every
+///   participant.
 pub struct MppShuffleInputs {
     pub child: Arc<dyn ExecutionPlan>,
     pub wiring: ShuffleWiring,
     pub drain_handle: Arc<DrainHandle>,
     pub wrapped_schema: SchemaRef,
-    /// Diagnostic label used in `mpp_log!` row-count reports. Typically one
-    /// of `"left"`, `"right"`, `"postagg"`, `"final"`. Purely for tracing;
-    /// no control flow depends on it.
     pub tag: &'static str,
-    /// Stage descriptor to stamp on both boundary nodes (the local
-    /// `ShuffleExec` send side and the peer-inbound `DrainGatherExec`). A
-    /// single mesh = one stage, so `ShuffleExec` and `DrainGatherExec` share
-    /// the same `MppStage`: the walker / bridge treats them as the two halves
-    /// of one cross-participant edge.
-    ///
-    /// `None` skips the stamp (legacy callers and tests that predate the
-    /// `MppNetworkBoundary` seam). The bridges in `exec_bridge.rs` always
-    /// pass `Some(...)`; once the generic cut walker (P3) lands and retires
-    /// the bridges we can tighten this to a non-optional field and delete the
-    /// legacy branch.
     pub stage: Option<MppStage>,
-    /// Hash-key physical exprs for the upstream `RepartitionExec(Hash)` whose
-    /// role this shuffle subsumes. When `Some`, [`wrap_with_mpp_shuffle`] caps
-    /// the topology with [`MppPartitionAdapterExec`] so the output declares
-    /// `Partitioning::Hash(keys, N)` — partition-aware DF optimizer rules
-    /// (EnforceDistribution, group-by partitioning matchers, etc.) can then
-    /// reason about the shuffle natively. When `None` (e.g. the
-    /// `FixedTargetPartitioner` scalar-final gather, where there is no
-    /// hash-key list to declare), the topology stays at
-    /// `Partitioning::UnknownPartitioning(1)` and no adapter is inserted.
     pub hash_keys: Option<Vec<Arc<dyn PhysicalExpr>>>,
+    pub drive_partition: u32,
 }
 
-/// Wrap a child plan with the MPP hash-shuffle topology.
+/// Wrap a child plan with the MPP hash-shuffle topology — a single
+/// [`MppShuffleExec`] that
 ///
-/// Output: a single-partition stream that contains
-///   - rows of `child` that hashed to this participant (via
-///     `ShuffleExec` — peer-bound rows are shipped to `wiring.outbound`
-///     before being dropped from the local stream);
-///   - rows sent by peers via shm_mq that the drain thread has read into
-///     `drain_handle.buffer` (via `DrainGatherExec`).
+///   * declares `Partitioning::Hash(keys, N)` natively when `hash_keys` is
+///     provided (or `UnknownPartitioning(1)` for the scalar-final gather),
+///   * consumes both halves of the mesh edge (`wiring` + `drain_handle`)
+///     internally, merging the producer-side stream (drives upstream,
+///     hash-routes, ships to peers) with the consumer-side stream (drains
+///     peer-shipped rows from `shm_mq`) on the participant's
+///     `drive_partition`,
+///   * returns an empty stream for every other partition.
 ///
-/// `UnionExec` alone would give us two partitions (one per child); since
-/// each caller (the PG Gather loop, HashJoinExec, etc.) only drives
-/// `execute(0)`, the second partition's `DrainGatherExec` would never be
-/// polled and peer-shipped rows would pile up unread. `CoalescePartitionsExec`
-/// above the Union merges the two streams into one partition so everything
-/// is read through partition 0. The output therefore has
-/// `Partitioning::UnknownPartitioning(1)`, which is what downstream
-/// `HashJoinExec(Partitioned)` expects as a pre-shuffled input.
+/// Replaces the older
+/// `MppPartitionAdapterExec(CoalescePartitionsExec(UnionExec(ShuffleExec,
+/// DrainGatherExec)))` four-node topology — same end-to-end semantics, one
+/// operator instead of four. Shape-aligned with
+/// `datafusion-distributed::NetworkShuffleExec`.
 ///
-/// Both mesh halves (`wiring` + `drain_handle`) are consumed on this single
-/// call. A two-input join needs TWO independent calls to this function —
-/// one per side — with independently-allocated meshes.
+/// Both mesh halves are consumed on this single call; a two-input join needs
+/// two independent calls — one per side — with independently-allocated
+/// meshes.
 pub fn wrap_with_mpp_shuffle(
     inputs: MppShuffleInputs,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
@@ -165,85 +143,29 @@ pub fn wrap_with_mpp_shuffle(
         tag,
         stage,
         hash_keys,
+        drive_partition,
     } = inputs;
-    let participant_index = wiring.participant_index;
-    let participant_count = wiring.partitioner.total_participants();
+    let _ = wrapped_schema; // Schema is inferred from `child.schema()`.
 
-    // Multi-partition children (e.g. a PgSearchTableProvider scan that emits one
-    // partition per Tantivy segment) need to be coalesced first: `ShuffleExec`
-    // only consumes its child's partition 0, so without this every segment
-    // beyond the first would be dropped silently, producing correct group
-    // counts but wildly wrong per-group aggregates.
+    // Multi-partition children (e.g. a PgSearchTableProvider scan that emits
+    // one partition per Tantivy segment) need to be coalesced first: the
+    // shuffle's producer-side only consumes its child's partition 0, so
+    // without this every segment beyond the first would be dropped silently,
+    // producing correct group counts but wildly wrong per-group aggregates.
     let child: Arc<dyn ExecutionPlan> = if child.output_partitioning().partition_count() > 1 {
         Arc::new(CoalescePartitionsExec::new(child))
     } else {
         child
     };
 
-    // Self-side: ShuffleExec partitions `child`'s stream by
-    // `wiring.partitioner`, emits the rows whose hash lands on this participant,
-    // and concurrently ships rows destined for peers through `wiring.outbound`.
-    let shuffle_node = ShuffleExec::new(child, wiring, tag);
-    let shuffle: Arc<dyn ExecutionPlan> = match stage {
-        // Stamp the ShuffleExec via the `MppNetworkBoundary` seam. The trait
-        // method consumes `self.wiring` and produces a fresh `Arc`; the
-        // un-stamped `shuffle_node` is dropped immediately after.
-        Some(s) => MppNetworkBoundary::with_input_stage(&shuffle_node, s)?,
-        None => Arc::new(shuffle_node),
-    };
-
-    // Peer-side: DrainGatherExec streams the batches the drain thread has
-    // pulled from this participant's inbound shm_mqs. Stamp with the *same*
-    // `MppStage` as the paired shuffle: one mesh = one stage, with local
-    // sender and peer-inbound receiver as its two halves.
-    let gather_node =
-        DrainGatherExec::new(drain_handle, wrapped_schema.clone(), tag, participant_index);
-    let gather: Arc<dyn ExecutionPlan> = match stage {
-        Some(s) => MppNetworkBoundary::with_input_stage(&gather_node, s)?,
-        None => Arc::new(gather_node),
-    };
-
-    // Splice both streams under a `UnionExec` and let
-    // `CoalescePartitionsExec` race their tokio tasks down to a single
-    // output partition. The "two tokio tasks both blocking in
-    // `shm_mq_send`" deadlock that originally pushed an earlier
-    // iteration toward a custom `ChainExec` operator is no longer
-    // structural: PR #4827 made `MppSender::send_batch_traced` async
-    // with `try_send_bytes` + `tokio::task::yield_now().await` between
-    // iterations, so the producer task gives up the runtime regularly
-    // and the `CoalescePartitionsExec` race resolves cleanly. Using
-    // standard DF operators here lets the planner reason about a known
-    // operator pair rather than a custom node.
-    //
-    // Correctness still relies on two structural guarantees:
-    //
-    //  1. `ShuffleExec` is a leaf-driver: polling it pumps rows through
-    //     the scan → split → ship-to-peers pipeline regardless of which
-    //     branch the runtime polled first. The drain thread populates
-    //     `DrainBuffer` independently of operator polling cadence.
-    //  2. `DrainGatherExec` only blocks until its sources mark EOF.
-    //     Peers' senders drop when their own `ShuffleExec` children
-    //     exhaust — independent of whether we're currently reading.
-    let _ = wrapped_schema; // Schema is inferred from `shuffle` via UnionExec.
-    let union = UnionExec::try_new(vec![shuffle, gather])?;
-    let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
-
-    // Promote to a native `Partitioning::Hash(keys, N)` declaration when the
-    // caller knows the keys. `MppPartitionAdapterExec` is a 1→N partition
-    // adapter: only `execute(participant_index)` returns rows; the other N-1
-    // partitions yield empty streams. The adapter sits above the
-    // `CoalescePartitionsExec(Union(...))` topology so `ShuffleExec` /
-    // `DrainGatherExec` need no per-partition awareness — they continue to
-    // produce the participant's full local slice, the adapter just relabels
-    // it under DF's native partition concept.
-    match hash_keys {
-        Some(keys) => Ok(Arc::new(MppPartitionAdapterExec::new(
-            coalesced,
-            keys,
-            participant_index,
-            participant_count,
-        ))),
-        None => Ok(coalesced),
+    let shuffle_node =
+        MppShuffleExec::new(child, wiring, drain_handle, hash_keys, drive_partition, tag);
+    match stage {
+        // Stamp via the `MppNetworkBoundary` seam. The trait method consumes
+        // the wiring + drain_handle Mutex<Option<>>s and produces a fresh
+        // `Arc`; the unstamped node is dropped immediately after.
+        Some(s) => MppNetworkBoundary::with_input_stage(&shuffle_node, s),
+        None => Ok(Arc::new(shuffle_node)),
     }
 }
 
@@ -333,6 +255,7 @@ mod tests {
             tag: "test",
             stage: None,
             hash_keys: None,
+            drive_partition: 0,
         })
         .unwrap();
 

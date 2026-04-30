@@ -75,8 +75,9 @@ use datafusion::common::hash_utils::create_hashes;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::stream::{EmptyRecordBatchStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
@@ -322,184 +323,6 @@ pub struct ShuffleWiring {
     /// one-sided pressure (observed as a 120s timeout on
     /// `aggregate_join_groupby - alternative 2` at 25M rows).
     pub cooperative_drain: Option<Arc<DrainHandle>>,
-}
-
-/// DataFusion `ExecutionPlan` that hashes every input row and ships non-self
-/// rows to peer participants via `MppSender`s, emitting only the
-/// self-partition rows as its output stream.
-///
-/// Peer-received rows are NOT merged in here — the plan builder layers a
-/// gather-style operator above `ShuffleExec` that unions the self-partition
-/// output with a `DrainBuffer` populated by the drain thread reading inbound
-/// receivers. Keeping the two sides separate at this layer makes the operator
-/// composable and individually testable.
-///
-/// The wiring (partitioner + senders) is taken on `new` and handed to the
-/// first `execute()` call via a `Mutex<Option<_>>`. A second `execute()` call
-/// would require re-planning the query and re-attaching a fresh mesh — not
-/// supported today; the `Option` returns an error on re-execute.
-///
-/// The wiring is also one-shot with respect to `with_new_children`: an
-/// optimizer rule that calls `with_new_children` *moves* the wiring into
-/// the freshly-built `ShuffleExec`, leaving the original instance in a
-/// "wiring-consumed" state where any subsequent `execute()` returns an
-/// error. `MppSender` is not `Clone`, so duplicating the wiring is not an
-/// option. In practice DataFusion's optimizer rewrites the plan top-down
-/// and drops the old node before any caller could `execute` it; this
-/// note exists so a future planner change that retains references to the
-/// old plan fails loudly with the right error rather than reaching some
-/// later "already executed" branch.
-pub struct ShuffleExec {
-    input: Arc<dyn ExecutionPlan>,
-    wiring: Mutex<Option<ShuffleWiring>>,
-    plan_properties: Arc<PlanProperties>,
-    /// Diagnostic label — e.g. "left", "right", "postagg", "final". Echoed
-    /// in the row-count `mpp_log!` line emitted at stream EOF. Purely for
-    /// tracing; no control flow depends on it.
-    tag: &'static str,
-    /// Stage this boundary consumes from. `None` on construction; stamped
-    /// by [`MppNetworkBoundary::with_input_stage`]. P1 seam only — read by
-    /// tests today and by the future channel-flatten dispatcher (P5b).
-    #[allow(dead_code)]
-    input_stage: Option<MppStage>,
-}
-
-impl fmt::Debug for ShuffleExec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ShuffleExec")
-            .field("input", &self.input)
-            .field("tag", &self.tag)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ShuffleExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, wiring: ShuffleWiring, tag: &'static str) -> Self {
-        let n = wiring.partitioner.total_participants();
-        assert_eq!(
-            wiring.outbound_senders.len(),
-            n as usize,
-            "ShuffleExec: outbound_senders.len() != total_participants"
-        );
-        assert!(
-            wiring.participant_index < n,
-            "ShuffleExec: participant_index >= total_participants"
-        );
-        assert!(
-            wiring.outbound_senders[wiring.participant_index as usize].is_none(),
-            "ShuffleExec: self participant sender slot must be None"
-        );
-
-        let eq_properties = EquivalenceProperties::new(input.schema());
-        // `UnknownPartitioning(1)` is intentional even though the rows
-        // emerging from the shuffle *are* hash-partitioned by
-        // `wiring.partitioner.key_columns`. MPP plans are hand-built —
-        // there is no `EnforceDistribution` rule running over them — so
-        // declaring `Partitioning::Hash(...)` would buy us nothing and
-        // would force us to materialise `Arc<dyn PhysicalExpr>`s for the
-        // key columns just to satisfy the API. If the planner ever runs
-        // `EnforceDistribution` over an MPP plan, revisit this so a
-        // downstream `HashJoinExec(Partitioned)` doesn't insert a
-        // redundant `RepartitionExec` on top of us.
-        let plan_properties = Arc::new(PlanProperties::new(
-            eq_properties,
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
-
-        Self {
-            input,
-            wiring: Mutex::new(Some(wiring)),
-            plan_properties,
-            tag,
-            input_stage: None,
-        }
-    }
-}
-
-impl MppNetworkBoundary for ShuffleExec {
-    fn input_stage(&self) -> Option<&MppStage> {
-        self.input_stage.as_ref()
-    }
-
-    fn with_input_stage(&self, stage: MppStage) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let wiring = self.wiring.lock().unwrap().take().ok_or_else(|| {
-            DataFusionError::Internal(
-                "ShuffleExec::with_input_stage: wiring already consumed".into(),
-            )
-        })?;
-        let mut node = ShuffleExec::new(self.input.clone(), wiring, self.tag);
-        node.input_stage = Some(stage);
-        Ok(Arc::new(node))
-    }
-}
-
-impl DisplayAs for ShuffleExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ShuffleExec")
-    }
-}
-
-impl ExecutionPlan for ShuffleExec {
-    fn name(&self) -> &str {
-        "ShuffleExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.plan_properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Internal(format!(
-                "ShuffleExec expects exactly one child, got {}",
-                children.len()
-            )));
-        }
-        // Cloning the wiring isn't possible (MppSender isn't Clone). This path
-        // is hit by some optimizer rules that re-wire children; those rules
-        // fire before we attach the wiring, so `None` means re-planning.
-        let wiring = self.wiring.lock().unwrap().take();
-        let Some(wiring) = wiring else {
-            return Err(DataFusionError::Internal(
-                "ShuffleExec: with_new_children called after wiring was consumed".into(),
-            ));
-        };
-        Ok(Arc::new(ShuffleExec::new(
-            children.into_iter().next().unwrap(),
-            wiring,
-            self.tag,
-        )))
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
-        let wiring = self
-            .wiring
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| DataFusionError::Internal("ShuffleExec: already executed".into()))?;
-        let child_stream = self.input.execute(0, context)?;
-        let schema = self.input.schema();
-        let stream = build_shuffle_stream(child_stream, wiring, self.tag);
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
 }
 
 /// Mutable per-stream state for [`build_shuffle_stream`]. Kept as a
@@ -806,139 +629,6 @@ fn log_shuffle_eof(tag: &'static str, state: &ShuffleState, t: ShuffleTimings) {
     }
 }
 
-/// DataFusion `ExecutionPlan` that drains a
-/// [`DrainBuffer`](crate::postgres::customscan::mpp::transport::DrainBuffer)
-/// as a `SendableRecordBatchStream`. In the MPP topology, the drain buffer is
-/// populated by the worker's drain thread reading peer-sent rows from inbound
-/// `shm_mq` queues; `DrainGatherExec` hands those rows to a `UnionExec` above
-/// it so they can merge with the local `ShuffleExec`'s self-partition output.
-///
-/// No child. Keeps the [`DrainHandle`] alive inside the operator so the
-/// drain thread is cancelled + joined on plan tear-down (whether clean or
-/// panic), closing the zombie-thread class of bugs the first review round
-/// flagged.
-pub struct DrainGatherExec {
-    drain_handle: Mutex<Option<Arc<DrainHandle>>>,
-    schema: SchemaRef,
-    plan_properties: Arc<PlanProperties>,
-    /// Diagnostic label — same value the sibling `ShuffleExec` uses so a
-    /// mesh's send-side and receive-side logs line up by tag.
-    tag: &'static str,
-    /// Remembered so `build_drain_gather_stream` can log which participant
-    /// received.
-    participant_index: u32,
-    /// Stage this boundary consumes from. P1 seam only.
-    #[allow(dead_code)]
-    input_stage: Option<MppStage>,
-}
-
-impl fmt::Debug for DrainGatherExec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DrainGatherExec")
-            .field("tag", &self.tag)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DrainGatherExec {
-    pub fn new(
-        drain_handle: Arc<DrainHandle>,
-        schema: SchemaRef,
-        tag: &'static str,
-        participant_index: u32,
-    ) -> Self {
-        let eq = EquivalenceProperties::new(schema.clone());
-        let plan_properties = Arc::new(PlanProperties::new(
-            eq,
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
-        Self {
-            drain_handle: Mutex::new(Some(drain_handle)),
-            schema,
-            plan_properties,
-            tag,
-            participant_index,
-            input_stage: None,
-        }
-    }
-}
-
-impl MppNetworkBoundary for DrainGatherExec {
-    fn input_stage(&self) -> Option<&MppStage> {
-        self.input_stage.as_ref()
-    }
-
-    fn with_input_stage(&self, stage: MppStage) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let handle = self.drain_handle.lock().unwrap().take().ok_or_else(|| {
-            DataFusionError::Internal(
-                "DrainGatherExec::with_input_stage: drain handle already consumed".into(),
-            )
-        })?;
-        let mut node = DrainGatherExec::new(
-            handle,
-            self.schema.clone(),
-            self.tag,
-            self.participant_index,
-        );
-        node.input_stage = Some(stage);
-        Ok(Arc::new(node))
-    }
-}
-
-impl DisplayAs for DrainGatherExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DrainGatherExec")
-    }
-}
-
-impl ExecutionPlan for DrainGatherExec {
-    fn name(&self) -> &str {
-        "DrainGatherExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.plan_properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Internal(format!(
-                "DrainGatherExec expects zero children, got {}",
-                children.len()
-            )));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
-        let handle =
-            self.drain_handle.lock().unwrap().take().ok_or_else(|| {
-                DataFusionError::Internal("DrainGatherExec: already executed".into())
-            })?;
-        let schema = self.schema.clone();
-        let stream =
-            build_drain_gather_stream(handle, schema.clone(), self.tag, self.participant_index);
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-}
-
 /// RAII guard ensuring `handle.shutdown()` runs even when the consumer
 /// drops the stream before the natural EOF/Err tail (e.g., a parent
 /// `LIMIT` shortcut, query cancel during the loop, panic). Without this,
@@ -1146,6 +836,273 @@ fn log_drain_gather_eof(tag: &'static str, participant_index: u32, t: DrainGathe
     }
 }
 
+/// Single-operator MPP shuffle: subsumes the role of the older
+/// `ShuffleExec + DrainGatherExec + MppPartitionAdapterExec +
+/// CoalescePartitionsExec(UnionExec(...))` topology.
+///
+/// Shape-aligned with `datafusion-distributed::NetworkShuffleExec`: declares
+/// `Partitioning::Hash(keys, N)` natively (or `UnknownPartitioning(1)` for
+/// the scalar-final gather where there is no hash key list to declare).
+/// The walker emits one `MppShuffleExec` per cut instead of building a
+/// four-node tree.
+///
+/// # Execution model
+///
+/// On each participant, exactly one output partition triggers the work —
+/// `drive_partition`. Other partitions return an empty stream immediately
+/// without consuming wiring.
+///
+/// - `HashPartitioner` boundary: `drive_partition = participant_index`. Every
+///   participant has output rows on its own partition; other partitions are
+///   semantically empty (their rows live on peer participants).
+/// - `FixedTargetPartitioner` boundary: `drive_partition = target` on every
+///   participant. The target's `execute(target)` returns the combined
+///   producer + drain stream; non-target participants' `execute(0)` still
+///   drives upstream (so their rows ship out via `shm_mq`) and yields an
+///   empty stream — same side-effect model as the old `ShuffleExec` when its
+///   self-routed sub-batch happened to be empty.
+///
+/// # Wiring lifecycle
+///
+/// `wiring` and `drain_handle` are one-shot: the first `execute(p)` call with
+/// `p == drive_partition` consumes both. Subsequent calls (after
+/// `with_new_children`, after a re-execute, etc.) error rather than silently
+/// re-running, mirroring the existing `ShuffleExec` invariant.
+pub struct MppShuffleExec {
+    input: Arc<dyn ExecutionPlan>,
+    wiring: Mutex<Option<ShuffleWiring>>,
+    drain_handle: Mutex<Option<Arc<DrainHandle>>>,
+    plan_properties: Arc<PlanProperties>,
+    tag: &'static str,
+    participant_index: u32,
+    drive_partition: u32,
+    /// Stage this boundary consumes from. P1 seam.
+    #[allow(dead_code)]
+    input_stage: Option<MppStage>,
+}
+
+impl fmt::Debug for MppShuffleExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MppShuffleExec")
+            .field("tag", &self.tag)
+            .field("drive_partition", &self.drive_partition)
+            .field("participant_index", &self.participant_index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MppShuffleExec {
+    /// Construct an `MppShuffleExec`.
+    ///
+    /// - `hash_keys`: when `Some`, output partitioning is
+    ///   `Partitioning::Hash(keys, total_participants)` — the hash-shuffle
+    ///   case. When `None`, output is `UnknownPartitioning(1)` — the
+    ///   scalar-final gather case where every row routes to one target.
+    /// - `drive_partition`: the output partition that triggers the
+    ///   participant's work. For hash shuffles this is `participant_index`;
+    ///   for fixed-target gathers it is `target` on every participant.
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        wiring: ShuffleWiring,
+        drain_handle: Arc<DrainHandle>,
+        hash_keys: Option<Vec<Arc<dyn PhysicalExpr>>>,
+        drive_partition: u32,
+        tag: &'static str,
+    ) -> Self {
+        let n = wiring.partitioner.total_participants();
+        let participant_index = wiring.participant_index;
+        assert_eq!(
+            wiring.outbound_senders.len(),
+            n as usize,
+            "MppShuffleExec: outbound_senders.len() != total_participants"
+        );
+        assert!(
+            participant_index < n,
+            "MppShuffleExec: participant_index >= total_participants"
+        );
+        assert!(
+            wiring.outbound_senders[participant_index as usize].is_none(),
+            "MppShuffleExec: self participant sender slot must be None"
+        );
+        assert!(
+            drive_partition < n,
+            "MppShuffleExec: drive_partition ({drive_partition}) >= total_participants ({n})"
+        );
+
+        let partitioning = match &hash_keys {
+            Some(keys) => Partitioning::Hash(keys.clone(), n as usize),
+            None => Partitioning::UnknownPartitioning(1),
+        };
+        let eq_properties = EquivalenceProperties::new(input.schema());
+        let plan_properties = Arc::new(PlanProperties::new(
+            eq_properties,
+            partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+
+        Self {
+            input,
+            wiring: Mutex::new(Some(wiring)),
+            drain_handle: Mutex::new(Some(drain_handle)),
+            plan_properties,
+            tag,
+            participant_index,
+            drive_partition,
+            input_stage: None,
+        }
+    }
+}
+
+impl MppNetworkBoundary for MppShuffleExec {
+    fn input_stage(&self) -> Option<&MppStage> {
+        self.input_stage.as_ref()
+    }
+
+    fn with_input_stage(&self, stage: MppStage) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let wiring = self.wiring.lock().unwrap().take().ok_or_else(|| {
+            DataFusionError::Internal(
+                "MppShuffleExec::with_input_stage: wiring already consumed".into(),
+            )
+        })?;
+        let drain_handle = self.drain_handle.lock().unwrap().take().ok_or_else(|| {
+            DataFusionError::Internal(
+                "MppShuffleExec::with_input_stage: drain handle already consumed".into(),
+            )
+        })?;
+        let hash_keys = match &self.plan_properties.partitioning {
+            Partitioning::Hash(exprs, _) => Some(exprs.clone()),
+            _ => None,
+        };
+        let mut node = MppShuffleExec::new(
+            self.input.clone(),
+            wiring,
+            drain_handle,
+            hash_keys,
+            self.drive_partition,
+            self.tag,
+        );
+        node.input_stage = Some(stage);
+        Ok(Arc::new(node))
+    }
+}
+
+impl DisplayAs for MppShuffleExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "MppShuffleExec: tag={} drive_partition={} participant={}",
+            self.tag, self.drive_partition, self.participant_index
+        )
+    }
+}
+
+impl ExecutionPlan for MppShuffleExec {
+    fn name(&self) -> &str {
+        "MppShuffleExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.plan_properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "MppShuffleExec expects exactly one child, got {}",
+                children.len()
+            )));
+        }
+        let wiring = self.wiring.lock().unwrap().take().ok_or_else(|| {
+            DataFusionError::Internal(
+                "MppShuffleExec: with_new_children called after wiring consumed".into(),
+            )
+        })?;
+        let drain_handle = self.drain_handle.lock().unwrap().take().ok_or_else(|| {
+            DataFusionError::Internal(
+                "MppShuffleExec: with_new_children called after drain handle consumed".into(),
+            )
+        })?;
+        let hash_keys = match &self.plan_properties.partitioning {
+            Partitioning::Hash(exprs, _) => Some(exprs.clone()),
+            _ => None,
+        };
+        Ok(Arc::new(MppShuffleExec::new(
+            children.into_iter().next().unwrap(),
+            wiring,
+            drain_handle,
+            hash_keys,
+            self.drive_partition,
+            self.tag,
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let n = self.plan_properties.partitioning.partition_count();
+        if partition >= n {
+            return Err(DataFusionError::Internal(format!(
+                "MppShuffleExec: partition {partition} >= partition_count {n}"
+            )));
+        }
+        if partition as u32 != self.drive_partition {
+            // Other partitions: empty stream. The drive_partition's stream
+            // performs all the work (drives upstream, ships peers, drains
+            // inbound). DataFusion will iterate execute(p) for every p in
+            // the declared partition count; only the drive partition is
+            // load-bearing.
+            return Ok(Box::pin(EmptyRecordBatchStream::new(self.input.schema())));
+        }
+
+        let wiring =
+            self.wiring.lock().unwrap().take().ok_or_else(|| {
+                DataFusionError::Internal("MppShuffleExec: already executed".into())
+            })?;
+        let drain_handle = self.drain_handle.lock().unwrap().take().ok_or_else(|| {
+            DataFusionError::Internal(
+                "MppShuffleExec: drain handle already consumed before execute".into(),
+            )
+        })?;
+
+        let child_stream = self.input.execute(0, context)?;
+        let producer = build_shuffle_stream(child_stream, wiring, self.tag);
+        let consumer = build_drain_gather_stream(
+            drain_handle,
+            self.input.schema(),
+            self.tag,
+            self.participant_index,
+        );
+
+        // Merge producer-side and consumer-side. `select` polls both
+        // concurrently on the same task; whichever has a batch ready first
+        // is yielded. Equivalent to the old
+        // `CoalescePartitionsExec(UnionExec(ShuffleExec, DrainGatherExec))`
+        // shape minus the per-side tokio task spawns — a single merged
+        // stream is sufficient because both halves are non-blocking
+        // futures; they cooperate via the in-band cooperative-drain
+        // pattern that `build_shuffle_stream` already implements.
+        let merged = futures::stream::select(producer, consumer);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.input.schema(),
+            merged,
+        )))
+    }
+}
+
 // `pub` (in test builds only, since the whole module is gated `#[cfg(test)]`)
 // so `plan_build.rs::tests` can reuse `ModuloPartitioner`. Keeping the
 // shared test helpers here rather than in a separate `test_helpers` module
@@ -1156,17 +1113,8 @@ pub mod tests {
     use crate::postgres::customscan::mpp::transport::{
         in_proc_channel, DrainBuffer, DrainConfig, DrainItem, MppReceiver, MppSender,
     };
-    use datafusion::arrow::array::{
-        Int32Array, Int64Array, RecordBatch as ArrowBatch, StringArray,
-    };
+    use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::datasource::memory::MemorySourceConfig;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::union::UnionExec;
-    use datafusion::physical_plan::ExecutionPlanProperties;
-    use datafusion::prelude::SessionContext;
-    use futures::StreamExt;
-    use std::thread;
 
     // ---- shared test helpers ----
 
@@ -1605,394 +1553,6 @@ pub mod tests {
             Ok(())
         });
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn shuffle_exec_emits_only_self_partition() {
-        // N=2 mesh as participant 0. Row i -> participant i % 2: self gets
-        // 0,2,4,6,8; peer gets 1,3,5,7,9.
-        let batch = sample_batch(10);
-        let schema = batch.schema();
-        let input = MemorySourceConfig::try_new_from_batches(schema.clone(), vec![batch]).unwrap();
-
-        let (tx, rx) = in_proc_channel(32);
-        let wiring = ShuffleWiring {
-            partitioner: Arc::new(ModuloPartitioner::new(2)),
-            outbound_senders: vec![None, Some(MppSender::new(Box::new(tx)))],
-            participant_index: 0,
-            cooperative_drain: None,
-        };
-        let shuffle: Arc<dyn ExecutionPlan> = Arc::new(ShuffleExec::new(input, wiring, "test"));
-
-        // Run the output stream to completion.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let ctx = SessionContext::new();
-        let self_batches: Vec<RecordBatch> = rt.block_on(async {
-            let mut stream = shuffle.execute(0, ctx.task_ctx()).unwrap();
-            let mut out = Vec::new();
-            while let Some(item) = stream.next().await {
-                out.push(item.unwrap());
-            }
-            out
-        });
-
-        // Self-partition output: row IDs should be 0, 2, 4, 6, 8.
-        let self_ids: Vec<i32> = self_batches
-            .iter()
-            .flat_map(|b| {
-                b.column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap()
-                    .values()
-                    .to_vec()
-            })
-            .collect();
-        assert_eq!(self_ids, vec![0, 2, 4, 6, 8]);
-
-        // Peer side: drain the channel and confirm we got 1, 3, 5, 7, 9.
-        let receiver = MppReceiver::new(Box::new(rx));
-        let buf = DrainBuffer::new(1);
-        let handle = DrainHandle::spawn(DrainConfig::new(vec![receiver], Arc::clone(&buf)));
-        let mut peer_ids: Vec<i32> = Vec::new();
-        while let DrainItem::Batch(b) = buf.pop_front() {
-            peer_ids.extend(
-                b.column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap()
-                    .values()
-                    .iter()
-                    .copied(),
-            );
-        }
-        handle.shutdown().unwrap();
-        assert_eq!(peer_ids, vec![1, 3, 5, 7, 9]);
-    }
-
-    #[test]
-    fn mpp_data_path_end_to_end_via_union() {
-        // Full milestone-1 MPP data path in one process, no PG:
-        //
-        //   MemorySourceConfig (10 rows)
-        //     -> ShuffleExec (self-partition output)
-        //                                   \
-        //   simulated-peer-sender           UnionExec -> collected output
-        //     -> DrainHandle                /
-        //     -> DrainGatherExec (peer-partition output)
-        //
-        // At participant 0 with ModuloPartitioner(N=2), ShuffleExec yields
-        // IDs {0,2,4,6,8}. A simulated peer pushes synthetic batches into
-        // the inbound drain (IDs 100, 200) before dropping the sender.
-        // UnionExec emits 5 + 2 = 7 rows. We assert on the exact ID
-        // multiset, with the peer side explicitly arriving *after* self
-        // because Union preserves child order.
-
-        let batch = sample_batch(10);
-        let schema = batch.schema();
-        let input = MemorySourceConfig::try_new_from_batches(schema.clone(), vec![batch]).unwrap();
-
-        let (out_tx, out_rx) = in_proc_channel(16); // outbound to peer
-        let (in_tx, in_rx) = in_proc_channel(16); // inbound from peer
-
-        // Our ShuffleExec at participant 0 in an N=2 mesh. Peer = participant 1.
-        let wiring = ShuffleWiring {
-            partitioner: Arc::new(ModuloPartitioner::new(2)),
-            outbound_senders: vec![None, Some(MppSender::new(Box::new(out_tx)))],
-            participant_index: 0,
-            cooperative_drain: None,
-        };
-        let shuffle: Arc<dyn ExecutionPlan> = Arc::new(ShuffleExec::new(input, wiring, "test"));
-
-        // Simulated peer: spawn a thread that pushes two synthetic batches
-        // into `in_tx` with a small delay between them so the buffer is
-        // *empty* when the main thread first polls — exercising the
-        // waker-based `Poll::Pending` path. If we pre-joined this thread
-        // (as an earlier version did), batches would all be buffered
-        // before the stream ran and the async contract would be untested.
-        let peer_schema = schema.clone();
-        let peer_thread = thread::spawn(move || {
-            let sender = MppSender::new(Box::new(in_tx));
-            for (id, name) in [(100i32, "peer100"), (200i32, "peer200")] {
-                thread::sleep(Duration::from_millis(10));
-                let batch = RecordBatch::try_new(
-                    peer_schema.clone(),
-                    vec![
-                        Arc::new(Int32Array::from_iter_values([id])),
-                        Arc::new(StringArray::from_iter_values([name.to_string()])),
-                    ],
-                )
-                .unwrap();
-                sender.send_batch(&batch).unwrap();
-            }
-            // `sender` drops here → peer receiver observes detach → EOF.
-        });
-
-        // DrainHandle draining the inbound channel into a DrainBuffer.
-        let receiver = MppReceiver::new(Box::new(in_rx));
-        let drain_buffer = DrainBuffer::new(1);
-        let drain_handle =
-            DrainHandle::spawn(DrainConfig::new(vec![receiver], Arc::clone(&drain_buffer)));
-        let gather: Arc<dyn ExecutionPlan> = Arc::new(DrainGatherExec::new(
-            Arc::new(drain_handle),
-            schema,
-            "test",
-            0,
-        ));
-
-        // Union: ShuffleExec emits first, then DrainGatherExec (Union
-        // preserves child order).
-        let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![shuffle, gather]).unwrap();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let ctx = SessionContext::new();
-
-        let mut all_ids = Vec::new();
-        rt.block_on(async {
-            // UnionExec reports output partitioning = N children; iterate
-            // each partition's stream in order.
-            let n_partitions = union.output_partitioning().partition_count();
-            for p in 0..n_partitions {
-                let mut s = union.execute(p, ctx.task_ctx()).unwrap();
-                while let Some(b) = s.next().await {
-                    let b = b.unwrap();
-                    let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-                    all_ids.extend(ids.values().iter().copied());
-                }
-            }
-        });
-
-        // Collect the outbound side into a second DrainBuffer just so we
-        // verify the ShuffleExec did, in fact, ship its peer rows.
-        let receiver = MppReceiver::new(Box::new(out_rx));
-        let out_buffer = DrainBuffer::new(1);
-        let out_handle =
-            DrainHandle::spawn(DrainConfig::new(vec![receiver], Arc::clone(&out_buffer)));
-        let mut outbound_ids = Vec::new();
-        while let DrainItem::Batch(b) = out_buffer.pop_front() {
-            outbound_ids.extend(
-                b.column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap()
-                    .values()
-                    .iter()
-                    .copied(),
-            );
-        }
-        out_handle.shutdown().unwrap();
-
-        peer_thread.join().unwrap();
-
-        // Assertions:
-        // 1. Union yielded self-partition (0,2,4,6,8) + peer-simulated (100, 200)
-        all_ids.sort();
-        assert_eq!(all_ids, vec![0, 2, 4, 6, 8, 100, 200]);
-        // 2. ShuffleExec correctly shipped odd IDs to peer
-        outbound_ids.sort();
-        assert_eq!(outbound_ids, vec![1, 3, 5, 7, 9]);
-    }
-
-    #[test]
-    fn drain_gather_exec_yields_eof_on_empty_peer() {
-        // Peer immediately drops the sender without shipping anything.
-        // DrainGatherExec must yield `None` cleanly via the waker path.
-
-        let (tx, rx) = in_proc_channel(4);
-        drop(MppSender::new(Box::new(tx))); // immediate EOF
-
-        let receiver = MppReceiver::new(Box::new(rx));
-        let buffer = DrainBuffer::new(1);
-        let handle = DrainHandle::spawn(DrainConfig::new(vec![receiver], Arc::clone(&buffer)));
-
-        let schema = sample_batch(1).schema();
-        let gather: Arc<dyn ExecutionPlan> =
-            Arc::new(DrainGatherExec::new(Arc::new(handle), schema, "test", 0));
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let ctx = SessionContext::new();
-        let count: usize = rt.block_on(async {
-            let mut stream = gather.execute(0, ctx.task_ctx()).unwrap();
-            let mut c = 0;
-            while let Some(_b) = stream.next().await {
-                c += 1;
-            }
-            c
-        });
-        assert_eq!(count, 0, "empty peer should yield zero batches");
-    }
-
-    #[test]
-    fn drain_gather_exec_rejects_schema_mismatch() {
-        // Peer ships a batch with an Int64 id column; the DrainGatherExec
-        // was told the schema has Int32. The stream must surface an error
-        // rather than silently emit the mismatched batch.
-        let peer_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let (tx, rx) = in_proc_channel(4);
-        let sender = MppSender::new(Box::new(tx));
-        let batch = RecordBatch::try_new(
-            peer_schema,
-            vec![Arc::new(Int64Array::from_iter_values([42i64]))],
-        )
-        .unwrap();
-        sender.send_batch(&batch).unwrap();
-        drop(sender);
-
-        let receiver = MppReceiver::new(Box::new(rx));
-        let buffer = DrainBuffer::new(1);
-        let handle = DrainHandle::spawn(DrainConfig::new(vec![receiver], Arc::clone(&buffer)));
-
-        let expected_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let gather: Arc<dyn ExecutionPlan> = Arc::new(DrainGatherExec::new(
-            Arc::new(handle),
-            expected_schema,
-            "test",
-            0,
-        ));
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let ctx = SessionContext::new();
-        let got_error = rt.block_on(async {
-            let mut stream = gather.execute(0, ctx.task_ctx()).unwrap();
-            matches!(stream.next().await, Some(Err(_)))
-        });
-        assert!(
-            got_error,
-            "DrainGatherExec must reject schema-mismatched batches"
-        );
-    }
-
-    #[test]
-    fn drain_gather_exec_yields_all_buffered_batches() {
-        // Set up a drain handle whose drain thread reads from an in-proc
-        // channel. Push 3 batches through the channel, then drop the sender
-        // to signal EOF. DrainGatherExec should yield exactly those 3
-        // batches.
-        let (tx, rx) = in_proc_channel(8);
-        let receiver = MppReceiver::new(Box::new(rx));
-        let buffer = DrainBuffer::new(1);
-        let handle = DrainHandle::spawn(DrainConfig::new(vec![receiver], Arc::clone(&buffer)));
-
-        // Sender feeds 3 sample batches then drops (→ EOF).
-        let sender = MppSender::new(Box::new(tx));
-        for rows in [2, 3, 5] {
-            sender.send_batch(&sample_batch(rows)).unwrap();
-        }
-        drop(sender);
-
-        let schema = sample_batch(1).schema();
-        let gather: Arc<dyn ExecutionPlan> =
-            Arc::new(DrainGatherExec::new(Arc::new(handle), schema, "test", 0));
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let ctx = SessionContext::new();
-        let totals: Vec<usize> = rt.block_on(async {
-            let mut stream = gather.execute(0, ctx.task_ctx()).unwrap();
-            let mut v = Vec::new();
-            while let Some(b) = stream.next().await {
-                v.push(b.unwrap().num_rows());
-            }
-            v
-        });
-        assert_eq!(totals, vec![2, 3, 5]);
-    }
-
-    #[test]
-    fn shuffle_exec_propagates_child_errors() {
-        // Custom child that errors on first poll.
-        #[derive(Debug)]
-        struct ErroringExec {
-            schema: SchemaRef,
-            properties: Arc<PlanProperties>,
-        }
-
-        impl DisplayAs for ErroringExec {
-            fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "ErroringExec")
-            }
-        }
-
-        impl ExecutionPlan for ErroringExec {
-            fn name(&self) -> &str {
-                "ErroringExec"
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-            fn properties(&self) -> &Arc<PlanProperties> {
-                &self.properties
-            }
-            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-                vec![]
-            }
-            fn with_new_children(
-                self: Arc<Self>,
-                _children: Vec<Arc<dyn ExecutionPlan>>,
-            ) -> DFResult<Arc<dyn ExecutionPlan>> {
-                Ok(self)
-            }
-            fn execute(
-                &self,
-                _partition: usize,
-                _context: Arc<TaskContext>,
-            ) -> DFResult<SendableRecordBatchStream> {
-                let schema = self.schema.clone();
-                let stream = futures::stream::once(async move {
-                    Err::<ArrowBatch, _>(DataFusionError::Execution("synthetic".into()))
-                });
-                Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-            }
-        }
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let input_exec: Arc<dyn ExecutionPlan> = {
-            let props = Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(schema.clone()),
-                Partitioning::UnknownPartitioning(1),
-                EmissionType::Incremental,
-                Boundedness::Bounded,
-            ));
-            Arc::new(ErroringExec {
-                schema: schema.clone(),
-                properties: props,
-            })
-        };
-
-        let (tx, _rx) = in_proc_channel(4);
-        let wiring = ShuffleWiring {
-            partitioner: Arc::new(ModuloPartitioner::new(2)),
-            outbound_senders: vec![None, Some(MppSender::new(Box::new(tx)))],
-            participant_index: 0,
-            cooperative_drain: None,
-        };
-        let shuffle: Arc<dyn ExecutionPlan> =
-            Arc::new(ShuffleExec::new(input_exec, wiring, "test"));
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let ctx = SessionContext::new();
-        let got_error = rt.block_on(async {
-            let mut stream = shuffle.execute(0, ctx.task_ctx()).unwrap();
-            matches!(stream.next().await, Some(Err(_)))
-        });
-        assert!(got_error, "ShuffleExec must propagate child errors");
     }
 
     #[test]
