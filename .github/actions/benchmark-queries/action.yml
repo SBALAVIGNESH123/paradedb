@@ -46,7 +46,11 @@ runs:
 
         if [ "${{ inputs.mode }}" = "existing" ]; then
           # Pre-sampled dataset loaded from S3.
-          cargo run --release -- benchmark existing \
+          cargo build --release
+          sudo mount -t tmpfs -o huge=always,size=1G tmpfs_pg ~/tmpfs-hp/
+          cp ../target/release/benchmark ~/tmpfs-hp/benchmark
+
+          numactl --cpunodebind=0 --membind=0 ~/tmpfs-hp/benchmark benchmark existing \
             --url "${POSTGRES_URL}" \
             --size ${{ inputs.size }} \
             --type pg_search \
