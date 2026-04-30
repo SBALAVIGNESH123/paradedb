@@ -248,7 +248,7 @@ jobs:
         working-directory: /home/runner/.pgrx/data-${{ env.pg_version }}/
         run: |
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM RESET ALL;"
-          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET shared_preload_libraries = 'pg_search';"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET shared_preload_libraries = pg_search,pg_stat_statements;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET maintenance_work_mem = '12GB';"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET shared_buffers = '12GB';"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_parallel_workers = 8;"
@@ -267,6 +267,13 @@ jobs:
         run: |
           cargo pgrx stop pg${{ env.pg_version }}
           cargo pgrx start pg${{ env.pg_version }}
+
+      - name: Setup pg_stat_statements
+        working-directory: /home/runner/.pgrx/data-${{ env.pg_version }}/
+        run: |
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "CREATE EXTENSION pg_stat_statements;"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET pg_stat_statements.track_planning = on;"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET pg_stat_statements.track = top ;"
 
       - name: Install pg_search
         working-directory: pg_search/

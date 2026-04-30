@@ -874,20 +874,6 @@ async fn prewarm_indexes(
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-struct ExplainPlan {
-    #[serde(rename = "Actual Rows")]
-    rows: f64,
-}
-
-#[derive(serde::Deserialize)]
-struct ExplainRow {
-    #[serde(rename = "Plan")]
-    plan: ExplainPlan,
-    #[serde(rename = "Execution Time")]
-    execution_time_ms: f64,
-}
-
 /// Execute a benchmark query multiple times on a single reused connection.
 ///
 /// This creates a fresh connection for each benchmark query and then reuses it across repeated
@@ -920,23 +906,18 @@ async fn execute_query_multiple_times(
     let mut results = Vec::new();
     let mut num_results = 0;
 
-    let query_group: Vec<_> = query.split(";").collect();
-    for q in query_group[0..query_group.len() - 1].iter() {
-        sqlx::raw_sql(q).execute(&mut conn).await?;
-    }
-    let explain_query = format!(
-        "EXPLAIN (ANALYZE, FORMAT JSON) {}",
-        query_group.last().unwrap()
-    );
+    let stats_query = "SELECT max_exec_time, max_plan_time, rows FROM pg_stat_statements WHERE query LIKE 'SELECT%';";
+    let reset_query = "SELECT pg_stat_statements_reset();";
     for i in 0..times {
-        let result: Result<(sqlx::types::Json<Vec<ExplainRow>>,), _> =
-            sqlx::query_as(&explain_query).fetch_one(&mut conn).await;
+        sqlx::raw_sql(reset_query).execute(&mut conn).await?;
+        sqlx::raw_sql(query).execute(&mut conn).await?;
+        let result: Result<(f64, f64, f64), _> =
+            sqlx::query_as(stats_query).fetch_one(&mut conn).await;
         match result {
-            Ok(r) => {
-                let r = &r.0 .0[0];
-                results.push(r.execution_time_ms);
+            Ok((exec_time, plan_time, rows)) => {
+                results.push(exec_time + plan_time);
                 if i == 0 {
-                    num_results = r.plan.rows as usize;
+                    num_results = rows as usize;
                 }
             }
             Err(err) => {
