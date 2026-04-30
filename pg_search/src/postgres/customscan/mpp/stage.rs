@@ -106,7 +106,7 @@ pub trait MppNetworkBoundary: ExecutionPlan {
     /// every walker-emitted boundary has a stamped stage. Read-side
     /// consumer (P5b channel-flatten dispatcher) doesn't exist yet, so
     /// the only live caller today is `#[cfg(test)]`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     fn input_stage(&self) -> Option<&MppStage>;
 
     /// Return a new instance with `input_stage` stamped to `stage`. The

@@ -87,12 +87,16 @@
                       // 52 still emits it as a plan node and we must recognize
                       // + reuse it.
 
+#[cfg(test)]
+use datafusion_distributed::require_one_child;
 use datafusion_distributed::{
-    require_one_child, AnnotatedPlan, PlanOrNetworkBoundary, TaskCountAnnotation,
+    distribute_annotated_plan, AnnotatedPlan, BoundaryFactory, DistributedConfig,
+    PlanOrNetworkBoundary, TaskCountAnnotation,
 };
 use std::collections::VecDeque;
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 #[cfg(test)]
 use datafusion::arrow::datatypes::SchemaRef;
@@ -571,54 +575,40 @@ fn rewrite_with_cuts(
     Ok(plan)
 }
 
-/// Per-walk state threaded through [`_distribute_plan`]'s recursion. Holds
-/// the pre-extracted scalars the emit arms need (query_id, participant_index,
-/// total_participants, shape) plus the pool of meshes allocated up front so
-/// each boundary visit just `pop_front`s one. Structured as a plain struct so
-/// the walker body stays close to DF-D's — the emit arms are a handful of
-/// lines that all dispatch through [`emit_shuffle_cut`].
-///
-/// Lifetime-free: the walker does not touch [`MppExecutionState`] during
-/// traversal. The caller extracts what the walker needs (via [`take_meshes`]
-/// / [`MppExecutionState::query_id`] / [`MppParticipantConfig`]) and hands it
-/// in. Keeping the walker free of coordinator references is what lets the
-/// unit tests drive it with in-process channels.
-///
-/// [`MppParticipantConfig`]: crate::postgres::customscan::mpp::MppParticipantConfig
-pub(super) struct CutEmitCtx {
-    /// Shape classification — consumed by [`tag_for_cut`] to derive the
-    /// byte-exact tag string each boundary passes to
-    /// [`wrap_with_mpp_shuffle`].
-    shape: MppPlanShape,
-    /// Bottom-up ordinal of the next boundary the walker will emit. Each
-    /// emit (`Shuffle` or `Coalesce`) increments by 1 after reading
-    /// [`tag_for_cut`].
-    cut_index: u32,
-    /// Mesh pool pre-drained from [`MppExecutionState`]; every emit pops one
-    /// from the front. Must hold exactly [`cut_count_for_shape`] meshes at
-    /// entry — the caller enforces this via [`take_meshes`].
+/// Per-query state the [`MppBoundaryFactory`] captures behind a
+/// [`Mutex`] so the fork's `_distribute_plan` walker can call our
+/// [`BoundaryFactory`] methods through a `&self` reference.
+struct MppBoundaryFactoryState {
+    /// Pool of pre-allocated meshes; each [`MppBoundaryFactory::shuffle`] /
+    /// [`MppBoundaryFactory::coalesce`] call pops one off the front.
     meshes: VecDeque<MeshHalves>,
-    /// Per-query stamp used by [`MppStage::new`] for every boundary.
+}
+
+/// [`BoundaryFactory`] implementation that emits ParadeDB's `MppShuffleExec`
+/// (instead of the fork's `NetworkShuffleExec` / `NetworkCoalesceExec` /
+/// `NetworkBroadcastExec`) for each annotated boundary the walker encounters.
+///
+/// The factory wraps the per-query mesh pool, query id, participant index,
+/// and shape classification — the same scalars the legacy `CutEmitCtx`
+/// carried — so the fork's `distribute_annotated_plan` walker can run
+/// unchanged and dispatch through the trait. The Mutex<>-wrapped state is
+/// the price of `&self` in the trait signature; the walker is single-
+/// threaded and the lock is uncontended.
+struct MppBoundaryFactory {
+    shape: MppPlanShape,
+    state: Mutex<MppBoundaryFactoryState>,
     query_id: u64,
-    /// Participant ordinal for this participant (0 = leader). Stamped onto
-    /// outbound senders as `task_number` and onto [`ShuffleWiring`] so
-    /// `ShuffleExec` drops the self-partition sender slot.
     participant_index: u32,
-    /// Total participants in the mesh. Sizes every partitioner (`HashPartitioner`,
-    /// `FixedTargetPartitioner`).
     total_participants: u32,
 }
 
-impl CutEmitCtx {
-    /// Construct a context from the pieces of an [`MppExecutionState`] the
-    /// walker actually needs. Pulls the mesh pool out of the state up front
-    /// so the walker itself can stay free of coordinator references.
-    ///
-    /// `expected_cuts` must equal [`cut_count_for_shape`] for the shape —
-    /// [`take_meshes`] panics otherwise, surfacing the leader/worker
-    /// contract mismatch loudly rather than deferring to a walker-side
-    /// error.
-    pub(super) fn from_state(
+impl MppBoundaryFactory {
+    /// Construct a factory by draining the meshes the leader / worker
+    /// allocated up front. `expected_cuts` must match
+    /// [`cut_count_for_shape`] for the shape — [`take_meshes`] panics
+    /// otherwise, surfacing the leader/worker contract mismatch loudly
+    /// rather than deferring to a walker-side error.
+    fn from_state(
         state: &mut MppExecutionState,
         shape: MppPlanShape,
         expected_cuts: usize,
@@ -628,122 +618,147 @@ impl CutEmitCtx {
         let total_participants = cfg.total_participants;
         let query_id = state.query_id();
         let meshes: VecDeque<MeshHalves> = take_meshes(state, expected_cuts).into();
-        CutEmitCtx {
+        Self {
             shape,
-            cut_index: 0,
-            meshes,
+            state: Mutex::new(MppBoundaryFactoryState { meshes }),
             query_id,
             participant_index,
             total_participants,
         }
     }
+
+    /// Shape-aware emit body shared by the `shuffle` and `coalesce` arms.
+    /// Pops a mesh, builds the `ShuffleWiring`, and hands off to
+    /// [`wrap_with_mpp_shuffle`] which constructs the `MppShuffleExec`.
+    fn emit_one_cut(
+        &self,
+        cut_index: u32,
+        child: Arc<dyn ExecutionPlan>,
+        partitioner: Arc<dyn RowPartitioner>,
+        tag: &'static str,
+        hash_keys: Option<Vec<Arc<dyn PhysicalExpr>>>,
+        drive_partition: u32,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let mesh = self
+            .state
+            .lock()
+            .unwrap()
+            .meshes
+            .pop_front()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "mpp: MppBoundaryFactory: out of mesh slots at cut {cut_index} ({tag}); \
+                     insert_mpp_cuts / cut_count_for_shape disagree"
+                ))
+            })?;
+        let stage = MppStage::new(self.query_id, cut_index, self.total_participants);
+        let drain = spawn_drain(mesh.inbound);
+        let task_key = MppTaskKey {
+            query_id: stage.query_id,
+            stage_id: stage.stage_id,
+            task_number: self.participant_index,
+        };
+        let outbound = attach_cooperative_drain(stamp_frame_ids(mesh.outbound, task_key), &drain);
+        let wiring = ShuffleWiring {
+            partitioner,
+            outbound_senders: outbound,
+            participant_index: self.participant_index,
+            cooperative_drain: Some(Arc::clone(&drain)),
+        };
+        let wrapped_schema = child.schema();
+        wrap_with_mpp_shuffle(MppShuffleInputs {
+            child,
+            wiring,
+            drain_handle: drain,
+            wrapped_schema,
+            tag,
+            stage: Some(stage),
+            hash_keys,
+            drive_partition,
+        })
+    }
+
+    /// Postcondition: every mesh popped corresponds to a real cut emitted
+    /// into the plan. The over-emit case is caught inside `emit_one_cut`
+    /// when `pop_front` returns `None`. This catches the symmetric
+    /// under-emit case where `insert_mpp_cuts` synthesized fewer cut
+    /// markers than `cut_count_for_shape` promised — meshes left
+    /// unconsumed here would otherwise be silently dropped along with
+    /// the factory.
+    fn assert_all_meshes_consumed(&self, observed_cuts: u32) -> DfResult<()> {
+        let leftover = self.state.lock().unwrap().meshes.len();
+        if leftover > 0 {
+            return Err(DataFusionError::Plan(format!(
+                "mpp: distribute_plan_generic: walker emitted {observed_cuts} cuts but \
+                 shape {:?} pre-allocated {} meshes; {leftover} meshes left unconsumed",
+                self.shape,
+                observed_cuts as usize + leftover
+            )));
+        }
+        Ok(())
+    }
 }
 
-/// Emit an [`ExecutionPlan`] from an [`AnnotatedPlan`], turning every
-/// network-boundary annotation into a concrete
-/// [`wrap_with_mpp_shuffle`] call. Ported in spirit from DF-D's
-/// `_distribute_plan`; ParadeDB deviates by having a single `Shuffle` emit
-/// path (no stage tree, no task estimators) and by tagging cuts with
-/// shape-aware labels so benchmark-log grep patterns keep working.
-///
-/// # Traversal
-///
-/// Post-order: descendants are emitted first, so the current node's
-/// `with_new_children` call (Plan arm) or its [`emit_shuffle_cut`] call
-/// (Shuffle / Coalesce arms) sees the already-rewritten subtree as its
-/// single child.
-///
-/// # Shuffle emit
-///
-/// The `Shuffle` boundary sits above a `RepartitionExec(Hash)` that
-/// [`insert_mpp_cuts`] synthesized. The walker extracts the hash-key
-/// column indices, drops the `RepartitionExec` layer, and wraps its
-/// underlying input directly with [`wrap_with_mpp_shuffle`] +
-/// `HashPartitioner`. Keeping the `RepartitionExec` around would add a
-/// redundant in-process partition that `ShuffleExec` already enforces
-/// across participants.
-///
-/// # Coalesce emit
-///
-/// The `Coalesce` boundary sits above the child of a
-/// `CoalescePartitionsExec` or `SortPreservingMergeExec`. The walker
-/// wraps that child with `FixedTargetPartitioner(0)` so every participant ships
-/// its rows to participant 0; the parent coalesce / merge is preserved in the
-/// Plan arm above it and remains responsible for the final single-stream
-/// output shape.
-///
-/// # ParadeDB post-passes
-///
-/// The emitted tree still carries ParadeDB-specific obligations that
-/// this walker deliberately does not handle — probe-side dynamic-filter
-/// strip + re-apply, `HashJoinExec` rebuild via `.builder()`,
-/// `CoalesceBatchesExec(65_536)` insert before the postagg shuffle,
-/// leader-only `AggregateExec(FinalPartitioned)`, and
-/// `VisibilityCtidResolverRule` re-run. Those live in explicit pre/post
-/// passes that the `distribute_plan` dispatcher orchestrates around this
-/// generic walker (Step 2d), keeping `_distribute_plan` itself as close
-/// to DF-D as the Rust 2021 / ParadeDB-constraint deltas allow.
-pub(super) fn _distribute_plan(
-    plan: AnnotatedPlan,
-    ctx: &mut CutEmitCtx,
-) -> DfResult<Arc<dyn ExecutionPlan>> {
-    // Recurse bottom-up so descendants' rewrites are in place before the
-    // current node's `with_new_children` call sees them. This matches DF-D's
-    // post-order traversal in `_distribute_plan`.
-    let new_children: Vec<Arc<dyn ExecutionPlan>> = plan
-        .children
-        .into_iter()
-        .map(|c| _distribute_plan(c, ctx))
-        .collect::<DfResult<Vec<_>>>()?;
+impl BoundaryFactory for MppBoundaryFactory {
+    fn shuffle(
+        &self,
+        child: Arc<dyn ExecutionPlan>,
+        _query_id: uuid::Uuid,
+        stage_id: usize,
+        _task_count: usize,
+        _input_task_count: usize,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let cut_index = stage_id as u32;
+        let tag = tag_for_cut(self.shape, cut_index);
+        let (partitioner, underlying, hash_keys) =
+            shuffle_keys_from_repartition(&child, self.total_participants)?;
+        // Hash shuffle: drive_partition is this participant's index — the
+        // partition that holds this participant's local slice of rows.
+        self.emit_one_cut(
+            cut_index,
+            underlying,
+            partitioner,
+            tag,
+            Some(hash_keys),
+            self.participant_index,
+        )
+    }
 
-    match plan.plan_or_nb {
-        PlanOrNetworkBoundary::Plan(p) => {
-            if new_children.is_empty() {
-                Ok(p)
-            } else {
-                Arc::clone(&p).with_new_children(new_children)
-            }
-        }
-        PlanOrNetworkBoundary::Shuffle => {
-            // Every boundary has exactly one child (the subtree it sits
-            // above). DF-D enforces this with `require_one_child`.
-            let child = require_one_child(&new_children)?;
-            let tag = tag_for_cut(ctx.shape, ctx.cut_index);
-            let (partitioner, underlying, hash_keys) =
-                shuffle_keys_from_repartition(&child, ctx.total_participants)?;
-            // Hash shuffle: drive_partition is this participant's index — the
-            // partition that holds this participant's local slice of rows.
-            let drive_partition = ctx.participant_index;
-            emit_shuffle_cut(
-                ctx,
-                underlying,
-                partitioner,
-                tag,
-                Some(hash_keys),
-                drive_partition,
-            )
-        }
-        PlanOrNetworkBoundary::Coalesce => {
-            let child = require_one_child(&new_children)?;
-            let tag = tag_for_cut(ctx.shape, ctx.cut_index);
-            let partitioner: Arc<dyn RowPartitioner> =
-                Arc::new(FixedTargetPartitioner::new(0, ctx.total_participants));
-            // Fixed-target gather: drive_partition is the target (0) on every
-            // participant. No hash keys to declare — output partitioning is
-            // `UnknownPartitioning(1)` since only the target ever has rows.
-            emit_shuffle_cut(ctx, child, partitioner, tag, None, 0)
-        }
-        PlanOrNetworkBoundary::Broadcast => {
-            // ParadeDB never emits a Broadcast annotation in `_annotate_plan` and
-            // never inserts a `BroadcastExec` marker in `insert_mpp_cuts`, so the
-            // fork's walker should not reach this arm. If it ever does, surface
-            // a planner error rather than silently no-op.
-            Err(DataFusionError::Internal(
-                "mpp: _distribute_plan: unexpected PlanOrNetworkBoundary::Broadcast — \
-                 ParadeDB does not produce broadcast annotations"
-                    .into(),
-            ))
-        }
+    fn coalesce(
+        &self,
+        child: Arc<dyn ExecutionPlan>,
+        _query_id: uuid::Uuid,
+        stage_id: usize,
+        _task_count: usize,
+        _input_task_count: usize,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let cut_index = stage_id as u32;
+        let tag = tag_for_cut(self.shape, cut_index);
+        let partitioner: Arc<dyn RowPartitioner> =
+            Arc::new(FixedTargetPartitioner::new(0, self.total_participants));
+        // Fixed-target gather: drive_partition is the target (0) on every
+        // participant. No hash keys to declare — output partitioning is
+        // `UnknownPartitioning(1)` since only the target ever has rows.
+        self.emit_one_cut(cut_index, child, partitioner, tag, None, 0)
+    }
+
+    fn broadcast(
+        &self,
+        _child: Arc<dyn ExecutionPlan>,
+        _query_id: uuid::Uuid,
+        _stage_id: usize,
+        _task_count: usize,
+        _input_task_count: usize,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // ParadeDB never emits a Broadcast annotation in `_annotate_plan`
+        // and never inserts a `BroadcastExec` marker in `insert_mpp_cuts`,
+        // so the fork's walker should not reach this arm. If it ever does,
+        // surface a planner error rather than silently no-op.
+        Err(DataFusionError::Internal(
+            "mpp: MppBoundaryFactory: unexpected Broadcast emit — \
+             ParadeDB does not produce broadcast annotations"
+                .into(),
+        ))
     }
 }
 
@@ -796,59 +811,6 @@ fn shuffle_keys_from_repartition(
     let partitioner: Arc<dyn RowPartitioner> =
         Arc::new(HashPartitioner::new(keys, total_participants));
     Ok((partitioner, Arc::clone(r_exec.input()), exprs.clone()))
-}
-
-/// Pop the next mesh off `ctx.meshes` and stitch up the full drain + sender
-/// + cooperative-drain + frame-stamp wiring that [`wrap_with_mpp_shuffle`]
-///   expects. Shared between the `Shuffle` and `Coalesce` emit arms; the only
-///   difference between them is the `partitioner` choice.
-///
-/// Panics (via `pgrx::error!` inside `take_meshes`) never fire here — the
-/// mesh count is checked up front in [`CutEmitCtx::from_state`]. Downstream
-/// error paths live inside [`wrap_with_mpp_shuffle`] itself and surface as
-/// `DataFusionError`.
-fn emit_shuffle_cut(
-    ctx: &mut CutEmitCtx,
-    child: Arc<dyn ExecutionPlan>,
-    partitioner: Arc<dyn RowPartitioner>,
-    tag: &'static str,
-    hash_keys: Option<Vec<Arc<dyn PhysicalExpr>>>,
-    drive_partition: u32,
-) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let mesh = ctx.meshes.pop_front().ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "mpp: _distribute_plan: out of mesh slots at cut {} ({tag}); \
-             insert_mpp_cuts / cut_count_for_shape disagree",
-            ctx.cut_index
-        ))
-    })?;
-    let stage = MppStage::new(ctx.query_id, ctx.cut_index, ctx.total_participants);
-    ctx.cut_index += 1;
-
-    let drain = spawn_drain(mesh.inbound);
-    let task_key = MppTaskKey {
-        query_id: stage.query_id,
-        stage_id: stage.stage_id,
-        task_number: ctx.participant_index,
-    };
-    let outbound = attach_cooperative_drain(stamp_frame_ids(mesh.outbound, task_key), &drain);
-    let wiring = ShuffleWiring {
-        partitioner,
-        outbound_senders: outbound,
-        participant_index: ctx.participant_index,
-        cooperative_drain: Some(Arc::clone(&drain)),
-    };
-    let wrapped_schema = child.schema();
-    wrap_with_mpp_shuffle(MppShuffleInputs {
-        child,
-        wiring,
-        drain_handle: drain,
-        wrapped_schema,
-        tag,
-        stage: Some(stage),
-        hash_keys,
-        drive_partition,
-    })
 }
 
 /// Map a (shape, bottom-up cut index) pair to the byte-exact tag string the
@@ -976,26 +938,24 @@ fn distribute_plan_generic(
     let prepared = prepare_for_mpp(shape, standard)?;
     let with_cuts = insert_mpp_cuts(prepared, shape, n)?;
     let annotated = annotate_plan(with_cuts, n)?;
-    let mut ctx = CutEmitCtx::from_state(mpp_state, shape, expected_cuts);
-    let emitted = _distribute_plan(annotated, &mut ctx)?;
-    // Postcondition: every mesh popped off `ctx.meshes` corresponds to a
-    // real cut emitted into the plan. The over-emit case (walker emits
-    // *more* cuts than allocated) is already caught inside
-    // `emit_shuffle_cut` when `pop_front` returns `None`. This catches
-    // the symmetric *under*-emit case where `insert_mpp_cuts`
-    // synthesized fewer cut markers than `cut_count_for_shape` promised
-    // — meshes left unconsumed here would otherwise be silently dropped
-    // along with `ctx`.
-    if !ctx.meshes.is_empty() {
-        return Err(DataFusionError::Plan(format!(
-            "mpp: distribute_plan_generic: walker emitted {} cuts but \
-             shape {:?} pre-allocated {} meshes; {} meshes left unconsumed",
-            ctx.cut_index,
-            shape,
-            expected_cuts,
-            ctx.meshes.len()
-        )));
-    }
+
+    // Drive the fork's walker through our `MppBoundaryFactory`. The fork's
+    // `_distribute_plan` increments `stage_id` once per emitted boundary
+    // bottom-up, which is exactly the cut index our `tag_for_cut` and
+    // `MppStage::new` consume. Starting from 0 keeps the tag mapping
+    // identical to the legacy walker.
+    let factory = MppBoundaryFactory::from_state(mpp_state, shape, expected_cuts);
+    // Fork's `_distribute_plan` calls `DistributedConfig::from_config_options`
+    // which expects the extension to be registered. We don't tune any
+    // distributed-specific knobs (broadcast_joins, partial_reduce, etc.) so
+    // the default values are correct for ParadeDB's pipeline.
+    let mut cfg = ConfigOptions::default();
+    cfg.extensions.insert(DistributedConfig::default());
+    let query_id = Uuid::nil();
+    let mut stage_id_after: usize = 0;
+    let emitted =
+        distribute_annotated_plan(annotated, &cfg, query_id, &mut stage_id_after, &factory)?;
+    factory.assert_all_meshes_consumed(stage_id_after as u32)?;
     finalize_for_mpp(shape, emitted, mpp_state, topk)
 }
 
@@ -2031,7 +1991,6 @@ fn walk_checking_visibility(node: &dyn ExecutionPlan, inside_shuffle: bool) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::postgres::customscan::mpp::stage::MppNetworkBoundary;
     use crate::postgres::customscan::mpp::transport::{in_proc_channel, MppSender};
     use datafusion::arrow::array::{Int32Array, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -2498,75 +2457,6 @@ mod tests {
     // expected number of `ShuffleExec` nodes with stamped `MppStage` ids.
     // ========================================================================
 
-    /// Build `count` empty mesh slots — each mesh has `count` outbound /
-    /// inbound edges per participant, with the self-participant slot left `None` so the
-    /// wiring matches what `take_meshes` would deliver at runtime. Participants
-    /// other than `participant_index` get live `in_proc_channel`s; their
-    /// receiver halves are dropped so the drain thread sees EOF instantly.
-    fn synth_meshes(
-        mesh_count: usize,
-        participant_index: u32,
-        total_participants: u32,
-    ) -> VecDeque<MeshHalves> {
-        let n = total_participants as usize;
-        let mut meshes = VecDeque::with_capacity(mesh_count);
-        for _ in 0..mesh_count {
-            let mut outbound: Vec<Option<MppSender>> = Vec::with_capacity(n);
-            let mut inbound: Vec<Option<MppReceiver>> = Vec::with_capacity(n);
-            for participant in 0..n {
-                if participant as u32 == participant_index {
-                    outbound.push(None);
-                    inbound.push(None);
-                    continue;
-                }
-                let (out_tx, _out_rx) = in_proc_channel(1);
-                outbound.push(Some(MppSender::new(Box::new(out_tx))));
-                let (_in_tx, in_rx) = in_proc_channel(1);
-                inbound.push(Some(MppReceiver::new(Box::new(in_rx))));
-            }
-            meshes.push_back(MeshHalves { outbound, inbound });
-        }
-        meshes
-    }
-
-    /// Construct a synthetic `CutEmitCtx` with `mesh_count` pre-allocated
-    /// in-process meshes — enough for tests to drive `_distribute_plan`
-    /// without wiring up a full `MppExecutionState`.
-    fn synth_ctx(shape: MppPlanShape, mesh_count: usize) -> CutEmitCtx {
-        CutEmitCtx {
-            shape,
-            cut_index: 0,
-            meshes: synth_meshes(mesh_count, 0, 2),
-            query_id: 0xdeadbeef,
-            participant_index: 0,
-            total_participants: 2,
-        }
-    }
-
-    /// Walk `plan` and collect every `ShuffleExec`. Sorted by
-    /// `input_stage.stage_id` so tests can assert tag/stage_id pairings in
-    /// emit order regardless of which subtree the walker descended first.
-    fn collect_shuffle_execs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&MppShuffleExec> {
-        // Emulate a trait-method traversal without writing a full Visitor:
-        // recursively borrow each node, try the downcast, descend into the
-        // node's children. `ShuffleExec` is the only type we care about so
-        // the single-type collector is adequate.
-        fn recurse<'a>(plan: &'a Arc<dyn ExecutionPlan>, out: &mut Vec<&'a MppShuffleExec>) {
-            if let Some(s) = plan.as_any().downcast_ref::<MppShuffleExec>() {
-                out.push(s);
-            }
-            for child in plan.children() {
-                // `plan.children()` returns `Vec<&Arc<dyn ExecutionPlan>>`
-                // — each child is a borrow rooted in the parent, so
-                // `recurse(child, out)` is sound.
-                recurse(child, out);
-            }
-        }
-        let mut out = Vec::new();
-        recurse(plan, &mut out);
-        out
-    }
-
     #[test]
     fn tag_for_cut_covers_every_live_shape() {
         assert_eq!(tag_for_cut(MppPlanShape::JoinOnly, 0), "join_left");
@@ -2620,228 +2510,5 @@ mod tests {
             tag_for_cut(MppPlanShape::GroupByAggSingleTable, 0),
             "mpp_unknown_cut"
         );
-    }
-
-    #[test]
-    fn distribute_plan_round_trips_boundary_free_plan() {
-        // A plain MemorySourceConfig has no boundary triggers, so the
-        // traversal should emit a tree identical in structure to the input:
-        // one Plan annotation per original node, no errors, no meshes
-        // consumed.
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let input = mem_source(&schema);
-        let annotated = annotate_plan(Arc::clone(&input), 2).unwrap();
-
-        let mut ctx = synth_ctx(MppPlanShape::JoinOnly, 0);
-        let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
-
-        // No boundaries ⇒ no cuts consumed, meshes untouched.
-        assert_eq!(ctx.cut_index, 0);
-        assert_eq!(ctx.meshes.len(), 0);
-        // Leaf plan re-emitted verbatim (same Arc, since `with_new_children`
-        // is skipped when `new_children.is_empty()`).
-        assert!(Arc::ptr_eq(&rebuilt, &input));
-        // And no shuffles were emitted.
-        assert_eq!(collect_shuffle_execs(&rebuilt).len(), 0);
-    }
-
-    #[test]
-    fn distribute_plan_recurses_through_plan_arms() {
-        // A Partial aggregate over a mem_source has no boundary triggers,
-        // so `_distribute_plan` should rebuild the tree without errors and
-        // without consuming any cut slots. Guards against a regression
-        // where the `Plan` arm's `with_new_children` call drops or
-        // double-wraps descendants.
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let input = mem_source(&schema);
-        let partial: Arc<dyn ExecutionPlan> = Arc::new(
-            AggregateExec::try_new(
-                AggregateMode::Partial,
-                PhysicalGroupBy::new_single(vec![]),
-                vec![],
-                vec![],
-                input,
-                schema.clone(),
-            )
-            .unwrap(),
-        );
-
-        let annotated = annotate_plan(Arc::clone(&partial), 2).unwrap();
-        let mut ctx = synth_ctx(MppPlanShape::ScalarAggOnBinaryJoin, 0);
-        let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
-
-        assert_eq!(ctx.cut_index, 0);
-        // Root must still be an AggregateExec(Partial). with_new_children
-        // on a single-child plan returns a fresh Arc even if the child is
-        // identical, so don't use Arc::ptr_eq on the root.
-        let rebuilt_agg = rebuilt
-            .as_any()
-            .downcast_ref::<AggregateExec>()
-            .expect("root is AggregateExec after round trip");
-        assert_eq!(*rebuilt_agg.mode(), AggregateMode::Partial);
-        assert_eq!(rebuilt.children().len(), 1);
-        assert_eq!(collect_shuffle_execs(&rebuilt).len(), 0);
-    }
-
-    #[test]
-    fn distribute_plan_shuffle_arm_emits_wrap_with_mpp_shuffle() {
-        // `annotate_plan` over a `RepartitionExec(Hash)` produces a Shuffle
-        // annotation; _distribute_plan must emit a live
-        // `wrap_with_mpp_shuffle` tree with tag `join_left` and
-        // input_stage stage_id 0. The underlying `RepartitionExec` layer
-        // is dropped — its purpose was only to carry the hash-key
-        // annotation to the walker.
-
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let input = mem_source(&schema);
-        let hash_key: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("id", 0))];
-        let repart: Arc<dyn ExecutionPlan> = Arc::new(
-            RepartitionExec::try_new(Arc::clone(&input), Partitioning::Hash(hash_key, 2)).unwrap(),
-        );
-        let annotated = annotate_plan(repart, 2).unwrap();
-
-        let mut ctx = synth_ctx(MppPlanShape::JoinOnly, 1);
-        let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
-
-        assert_eq!(ctx.cut_index, 1);
-        assert_eq!(ctx.meshes.len(), 0, "mesh pool drained by the single cut");
-
-        // Exactly one ShuffleExec emitted, stamped with cut_index 0 and
-        // the JoinOnly 0→"join_left" tag. `input_stage` is proof the
-        // boundary went through the `MppNetworkBoundary::with_input_stage`
-        // seam — i.e. `wrap_with_mpp_shuffle` actually ran.
-        let shuffles = collect_shuffle_execs(&rebuilt);
-        assert_eq!(shuffles.len(), 1, "expected a single ShuffleExec");
-        let stage = shuffles[0].input_stage().expect("stage was stamped");
-        assert_eq!(stage.query_id, 0xdeadbeef);
-        assert_eq!(stage.stage_id, 0);
-        assert_eq!(stage.task_count, 2);
-        // Sanity: the DataFusion `RepartitionExec` marker doesn't survive
-        // — only scan-level children should remain below the shuffle.
-        // Match on a leading-space boundary so the substring doesn't trip
-        // on the renamed `ShuffleExec` (which embeds the same
-        // `RepartitionExec` token).
-        let debug = format!("{rebuilt:?}");
-        assert!(
-            !debug.contains(" RepartitionExec ") && !debug.contains(" RepartitionExec {"),
-            "DataFusion RepartitionExec marker should be dropped: {debug}"
-        );
-    }
-
-    #[test]
-    fn distribute_plan_coalesce_arm_emits_wrap_with_mpp_shuffle() {
-        // CoalescePartitionsExec over a non-leaf child is the DF-D Coalesce
-        // trigger — `annotate_plan` places the boundary on the child. With
-        // `ScalarAggOnBinaryJoin` shape and the only cut at index 0, the
-        // emit must use tag `scalar_left` (this is a minimal synthetic
-        // tree — the test proves the emit runs, not that the tag is
-        // semantically correct for a real scalar-agg plan).
-
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let input = mem_source(&schema);
-        let partial: Arc<dyn ExecutionPlan> = Arc::new(
-            AggregateExec::try_new(
-                AggregateMode::Partial,
-                PhysicalGroupBy::new_single(vec![]),
-                vec![],
-                vec![],
-                input,
-                schema.clone(),
-            )
-            .unwrap(),
-        );
-        let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(partial));
-        let annotated = annotate_plan(coalesced, 2).unwrap();
-
-        let mut ctx = synth_ctx(MppPlanShape::ScalarAggOnBinaryJoin, 1);
-        let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
-
-        assert_eq!(ctx.cut_index, 1);
-        assert_eq!(ctx.meshes.len(), 0);
-
-        // The outer CoalescePartitionsExec is preserved in the Plan arm;
-        // the emitted shuffle sits beneath it. That's fine for the
-        // generic walker — the ParadeDB post-pass (Step 2d) strips the
-        // coalesce marker when the shape calls for it.
-        let shuffles = collect_shuffle_execs(&rebuilt);
-        assert_eq!(shuffles.len(), 1, "expected a single ShuffleExec");
-        let stage = shuffles[0].input_stage().expect("stage was stamped");
-        assert_eq!(stage.stage_id, 0);
-    }
-
-    #[test]
-    fn distribute_plan_cuts_emit_bottom_up() {
-        // Two stacked `RepartitionExec(Hash)` wrap a leaf. `annotate_plan`
-        // yields Shuffle(Plan(RepartitionExec, Shuffle(Plan(RepartitionExec,
-        // Plan(leaf))))). Bottom-up emit assigns cut_index 0 to the inner
-        // shuffle (`join_left`) and cut_index 1 to the outer (`join_right`).
-        // If the walker ever goes top-down, the stage_ids invert.
-
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let input = mem_source(&schema);
-        let k0: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("id", 0))];
-        let inner: Arc<dyn ExecutionPlan> =
-            Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(k0, 2)).unwrap());
-        let k1: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("id", 0))];
-        let outer: Arc<dyn ExecutionPlan> =
-            Arc::new(RepartitionExec::try_new(inner, Partitioning::Hash(k1, 2)).unwrap());
-        let annotated = annotate_plan(outer, 2).unwrap();
-
-        let mut ctx = synth_ctx(MppPlanShape::JoinOnly, 2);
-        let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
-
-        assert_eq!(ctx.cut_index, 2);
-        assert_eq!(ctx.meshes.len(), 0);
-
-        let shuffles = collect_shuffle_execs(&rebuilt);
-        assert_eq!(shuffles.len(), 2);
-        // Stage_ids in tree-traversal order (whichever order
-        // `collect_shuffle_execs` produces) must include both 0 and 1.
-        let mut seen_ids: Vec<u32> = shuffles
-            .iter()
-            .map(|s| s.input_stage().unwrap().stage_id)
-            .collect();
-        seen_ids.sort();
-        assert_eq!(seen_ids, vec![0, 1]);
-    }
-
-    #[test]
-    fn distribute_plan_shuffle_arm_rejects_non_repartition_child() {
-        // If a Shuffle annotation somehow sits above something other than
-        // a RepartitionExec(Hash), the emit arm surfaces a
-        // `DataFusionError::Plan` rather than silently wrapping a bogus
-        // partitioner. Covers a malformed pre-pass upstream of the walker.
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let input = mem_source(&schema);
-        // Build an annotated tree with a Shuffle boundary manually —
-        // `annotate_plan` itself only produces Shuffle boundaries above
-        // RepartitionExec(Hash), but the walker must still defend.
-        let annotated = AnnotatedPlan {
-            plan_or_nb: PlanOrNetworkBoundary::Shuffle,
-            children: vec![AnnotatedPlan {
-                plan_or_nb: PlanOrNetworkBoundary::Plan(Arc::clone(&input)),
-                children: vec![],
-                task_count: TaskCountAnnotation::Desired(2),
-            }],
-            task_count: TaskCountAnnotation::Desired(2),
-        };
-
-        let mut ctx = synth_ctx(MppPlanShape::JoinOnly, 1);
-        let err = _distribute_plan(annotated, &mut ctx)
-            .expect_err("malformed Shuffle child must surface as Plan error");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("expected RepartitionExec"),
-            "unexpected error: {msg}"
-        );
-        // cut_index did NOT advance — the walker errors out before
-        // consuming a tag slot.
-        assert_eq!(ctx.cut_index, 0);
     }
 }
