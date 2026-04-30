@@ -262,9 +262,9 @@ jobs:
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_wal_senders = 0;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET wal_level = minimal;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET huge_pages = on;"
-          sysctl -w vm.nr_hugepages=10000
-          echo never > /sys/kernel/mm/transparent_hugepage/enabled
-          echo never > /sys/kernel/mm/transparent_hugepage/defrag
+          sudo sysctl -w vm.nr_hugepages=10000
+          sudo echo never > /sys/kernel/mm/transparent_hugepage/enabled
+          sudo echo never > /sys/kernel/mm/transparent_hugepage/defrag
 
       - name: Restart Postgres
         working-directory: pg_search/
