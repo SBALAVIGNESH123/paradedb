@@ -87,9 +87,10 @@
                       // 52 still emits it as a plan node and we must recognize
                       // + reuse it.
 
-use std::borrow::Borrow;
+use datafusion_distributed::{
+    require_one_child, AnnotatedPlan, PlanOrNetworkBoundary, TaskCountAnnotation,
+};
 use std::collections::VecDeque;
-use std::fmt;
 use std::mem;
 use std::sync::Arc;
 
@@ -332,76 +333,12 @@ fn validate_shape_matches_topk_upgrade(classified: MppPlanShape) -> DfResult<()>
 // `Ineligible` and `GroupByAggSingleTable` error out at the dispatcher.
 // ============================================================================
 
-/// Annotation attached to a single [`ExecutionPlan`] that determines the kind
-/// of network boundary needed just below itself. Ported verbatim from DF-D
-/// minus the `Broadcast` variant (not applicable to ParadeDB).
-pub(super) enum PlanOrNetworkBoundary {
-    Plan(Arc<dyn ExecutionPlan>),
-    Shuffle,
-    Coalesce,
-}
-
-impl fmt::Debug for PlanOrNetworkBoundary {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Plan(plan) => write!(f, "{}", plan.name()),
-            Self::Shuffle => write!(f, "[NetworkBoundary] Shuffle"),
-            Self::Coalesce => write!(f, "[NetworkBoundary] Coalesce"),
-        }
-    }
-}
-
-impl PlanOrNetworkBoundary {
-    #[allow(dead_code)]
-    pub(super) fn is_network_boundary(&self) -> bool {
-        matches!(self, Self::Shuffle | Self::Coalesce)
-    }
-}
-
-/// Wraps an [`ExecutionPlan`] and annotates it with information about whether
-/// it needs a network boundary below it. Ported from DF-D minus `task_count`
-/// (ParadeDB has a fixed N; no propagation pass).
-pub(super) struct AnnotatedPlan {
-    /// The annotated [`ExecutionPlan`].
-    pub(super) plan_or_nb: PlanOrNetworkBoundary,
-    /// The annotated children of this [`ExecutionPlan`]. When
-    /// `plan_or_nb == Plan(p)`, this holds the annotated form of
-    /// `p.children()`. When `plan_or_nb` is a network boundary, this holds
-    /// the single node that sits below the boundary.
-    pub(super) children: Vec<AnnotatedPlan>,
-}
-
-impl fmt::Debug for AnnotatedPlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn fmt_dbg(f: &mut fmt::Formatter<'_>, plan: &AnnotatedPlan, depth: usize) -> fmt::Result {
-            write!(f, "{}{:?}", " ".repeat(depth * 2), plan.plan_or_nb)?;
-            writeln!(f)?;
-            for child in plan.children.iter() {
-                fmt_dbg(f, child, depth + 1)?;
-            }
-            Ok(())
-        }
-        fmt_dbg(f, self, 0)
-    }
-}
-
-/// Ported verbatim from DF-D's `common/children_helpers.rs`. Used by
-/// `_distribute_plan` (Step 2c) to unwrap the single child beneath a
-/// network-boundary annotation when rewriting plans via `with_new_children`.
-pub(super) fn require_one_child<L, T>(children: L) -> DfResult<Arc<dyn ExecutionPlan>>
-where
-    L: AsRef<[T]>,
-    T: Borrow<Arc<dyn ExecutionPlan>>,
-{
-    let children = children.as_ref();
-    if children.len() != 1 {
-        return Err(DataFusionError::Plan(format!(
-            "Expected exactly 1 children, got {}",
-            children.len()
-        )));
-    }
-    Ok(children[0].borrow().clone())
-}
+// `PlanOrNetworkBoundary` and `AnnotatedPlan` are now imported from the
+// `datafusion-distributed` fork (the `paradedb/boundary-factory` branch).
+// The fork's variant of `PlanOrNetworkBoundary` has a `Broadcast` arm that
+// ParadeDB never emits — `_annotate_plan` below produces only `Plan`,
+// `Shuffle`, and `Coalesce` annotations, and `MppBoundaryFactory::broadcast`
+// errors loudly if the fork's walker ever asks for one.
 
 /// Annotates recursively an [`ExecutionPlan`] and its children with
 /// information about whether a network boundary is needed below it. Ported
@@ -420,24 +357,30 @@ where
 /// because the serial plan emits neither trigger. Step 2b adds
 /// `insert_mpp_cuts`, a pre-pass that synthesizes the expected markers per
 /// [`MppPlanShape`] before this walker runs.
-pub(super) fn annotate_plan(plan: Arc<dyn ExecutionPlan>) -> DfResult<AnnotatedPlan> {
-    _annotate_plan(plan, None)
+pub(super) fn annotate_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    total_participants: u32,
+) -> DfResult<AnnotatedPlan> {
+    let task_count = TaskCountAnnotation::Desired(total_participants as usize);
+    _annotate_plan(plan, None, task_count)
 }
 
 fn _annotate_plan(
     plan: Arc<dyn ExecutionPlan>,
     parent: Option<&Arc<dyn ExecutionPlan>>,
+    task_count: TaskCountAnnotation,
 ) -> DfResult<AnnotatedPlan> {
     let annotated_children: Vec<AnnotatedPlan> = plan
         .children()
         .into_iter()
-        .map(|child| _annotate_plan(Arc::clone(child), Some(&plan)))
+        .map(|child| _annotate_plan(Arc::clone(child), Some(&plan), task_count.clone()))
         .collect::<DfResult<Vec<_>>>()?;
 
     // Wrap the node with a boundary node if the parent marks it.
     let mut annotation = AnnotatedPlan {
         plan_or_nb: PlanOrNetworkBoundary::Plan(Arc::clone(&plan)),
         children: annotated_children,
+        task_count: task_count.clone(),
     };
 
     // Upon reaching a hash repartition, we need to introduce a shuffle right above it.
@@ -446,6 +389,7 @@ fn _annotate_plan(
             annotation = AnnotatedPlan {
                 plan_or_nb: PlanOrNetworkBoundary::Shuffle,
                 children: vec![annotation],
+                task_count: task_count.clone(),
             };
         }
     } else if let Some(parent) = parent {
@@ -464,6 +408,7 @@ fn _annotate_plan(
             annotation = AnnotatedPlan {
                 plan_or_nb: PlanOrNetworkBoundary::Coalesce,
                 children: vec![annotation],
+                task_count,
             };
         }
     }
@@ -788,6 +733,17 @@ pub(super) fn _distribute_plan(
             // `UnknownPartitioning(1)` since only the target ever has rows.
             emit_shuffle_cut(ctx, child, partitioner, tag, None, 0)
         }
+        PlanOrNetworkBoundary::Broadcast => {
+            // ParadeDB never emits a Broadcast annotation in `_annotate_plan` and
+            // never inserts a `BroadcastExec` marker in `insert_mpp_cuts`, so the
+            // fork's walker should not reach this arm. If it ever does, surface
+            // a planner error rather than silently no-op.
+            Err(DataFusionError::Internal(
+                "mpp: _distribute_plan: unexpected PlanOrNetworkBoundary::Broadcast — \
+                 ParadeDB does not produce broadcast annotations"
+                    .into(),
+            ))
+        }
     }
 }
 
@@ -1019,7 +975,7 @@ fn distribute_plan_generic(
 
     let prepared = prepare_for_mpp(shape, standard)?;
     let with_cuts = insert_mpp_cuts(prepared, shape, n)?;
-    let annotated = annotate_plan(with_cuts)?;
+    let annotated = annotate_plan(with_cuts, n)?;
     let mut ctx = CutEmitCtx::from_state(mpp_state, shape, expected_cuts);
     let emitted = _distribute_plan(annotated, &mut ctx)?;
     // Postcondition: every mesh popped off `ctx.meshes` corresponds to a
@@ -2224,7 +2180,7 @@ mod tests {
         let repart: Arc<dyn ExecutionPlan> =
             Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(vec![key], 2)).unwrap());
 
-        let annotated = annotate_plan(repart).unwrap();
+        let annotated = annotate_plan(repart, 2).unwrap();
         // The trigger sits *above* the RepartitionExec, so the top of the
         // annotated tree is the Shuffle boundary whose sole child is the
         // RepartitionExec-as-Plan.
@@ -2247,7 +2203,7 @@ mod tests {
         let repart: Arc<dyn ExecutionPlan> =
             Arc::new(RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(2)).unwrap());
 
-        let annotated = annotate_plan(repart).unwrap();
+        let annotated = annotate_plan(repart, 2).unwrap();
         // Non-hash repartitioning is not a DF-D cut trigger.
         assert!(matches!(
             annotated.plan_or_nb,
@@ -2282,7 +2238,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let annotated = annotate_plan(partial).unwrap();
+        let annotated = annotate_plan(partial, 2).unwrap();
         assert_no_boundary(&annotated);
     }
 
@@ -2306,7 +2262,7 @@ mod tests {
             .unwrap(),
         );
         let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(partial));
-        let annotated = annotate_plan(coalesced).unwrap();
+        let annotated = annotate_plan(coalesced, 2).unwrap();
 
         // Root is the CoalescePartitionsExec itself (annotated as Plan; the
         // trigger only wraps the child that sits *under* the coalesce).
@@ -2339,7 +2295,7 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let input = mem_source(&schema);
         let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(input));
-        let annotated = annotate_plan(coalesced).unwrap();
+        let annotated = annotate_plan(coalesced, 2).unwrap();
 
         assert!(matches!(
             annotated.plan_or_nb,
@@ -2433,7 +2389,7 @@ mod tests {
         assert_eq!(*partial.mode(), AggregateMode::Partial);
 
         // Cross-check: annotate_plan should see exactly one Coalesce boundary.
-        let annotated = annotate_plan(Arc::clone(&rewritten)).unwrap();
+        let annotated = annotate_plan(Arc::clone(&rewritten), 2).unwrap();
         assert!(matches!(
             annotated.plan_or_nb,
             PlanOrNetworkBoundary::Plan(_)
@@ -2472,7 +2428,7 @@ mod tests {
 
         // Cross-check: annotate_plan should see a Shuffle boundary on the
         // RepartitionExec.
-        let annotated = annotate_plan(Arc::clone(&rewritten)).unwrap();
+        let annotated = annotate_plan(Arc::clone(&rewritten), 2).unwrap();
         assert!(matches!(
             annotated.plan_or_nb,
             PlanOrNetworkBoundary::Shuffle
@@ -2675,7 +2631,7 @@ mod tests {
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let input = mem_source(&schema);
-        let annotated = annotate_plan(Arc::clone(&input)).unwrap();
+        let annotated = annotate_plan(Arc::clone(&input), 2).unwrap();
 
         let mut ctx = synth_ctx(MppPlanShape::JoinOnly, 0);
         let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
@@ -2712,7 +2668,7 @@ mod tests {
             .unwrap(),
         );
 
-        let annotated = annotate_plan(Arc::clone(&partial)).unwrap();
+        let annotated = annotate_plan(Arc::clone(&partial), 2).unwrap();
         let mut ctx = synth_ctx(MppPlanShape::ScalarAggOnBinaryJoin, 0);
         let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
 
@@ -2745,7 +2701,7 @@ mod tests {
         let repart: Arc<dyn ExecutionPlan> = Arc::new(
             RepartitionExec::try_new(Arc::clone(&input), Partitioning::Hash(hash_key, 2)).unwrap(),
         );
-        let annotated = annotate_plan(repart).unwrap();
+        let annotated = annotate_plan(repart, 2).unwrap();
 
         let mut ctx = synth_ctx(MppPlanShape::JoinOnly, 1);
         let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
@@ -2799,7 +2755,7 @@ mod tests {
             .unwrap(),
         );
         let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(partial));
-        let annotated = annotate_plan(coalesced).unwrap();
+        let annotated = annotate_plan(coalesced, 2).unwrap();
 
         let mut ctx = synth_ctx(MppPlanShape::ScalarAggOnBinaryJoin, 1);
         let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
@@ -2834,7 +2790,7 @@ mod tests {
         let k1: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("id", 0))];
         let outer: Arc<dyn ExecutionPlan> =
             Arc::new(RepartitionExec::try_new(inner, Partitioning::Hash(k1, 2)).unwrap());
-        let annotated = annotate_plan(outer).unwrap();
+        let annotated = annotate_plan(outer, 2).unwrap();
 
         let mut ctx = synth_ctx(MppPlanShape::JoinOnly, 2);
         let rebuilt = _distribute_plan(annotated, &mut ctx).unwrap();
@@ -2871,7 +2827,9 @@ mod tests {
             children: vec![AnnotatedPlan {
                 plan_or_nb: PlanOrNetworkBoundary::Plan(Arc::clone(&input)),
                 children: vec![],
+                task_count: TaskCountAnnotation::Desired(2),
             }],
+            task_count: TaskCountAnnotation::Desired(2),
         };
 
         let mut ctx = synth_ctx(MppPlanShape::JoinOnly, 1);
