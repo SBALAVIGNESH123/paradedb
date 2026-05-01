@@ -288,6 +288,10 @@ async fn run_benchmarks(args: &CommonBenchmarkArgs) -> anyhow::Result<Vec<QueryR
         eprintln!("WARNING: Failed to initialize pg_buffercache extension: {err}");
     }
 
+    if let Err(err) = capture_all_table_stats(&args.url).await {
+        eprintln!("WARNING: capture_all_table_stats failed: {err}");
+    }
+
     // Locate all query paths, and sort them for stability in the output.
     let queries_dir = format!("datasets/{}/queries/{}", args.dataset, args.r#type);
     let query_paths: anyhow::Result<Vec<Option<_>>> = std::fs::read_dir(queries_dir)
@@ -315,6 +319,9 @@ async fn run_benchmarks(args: &CommonBenchmarkArgs) -> anyhow::Result<Vec<QueryR
                 }
             }
             println!("Query Type: {query_type}\nQuery: {query}");
+            if let Err(err) = capture_explain_plan(&args.url, &query_type, &query).await {
+                eprintln!("WARNING: EXPLAIN capture failed for `{query_type}`: {err}");
+            }
             let result = execute_query_multiple_times(
                 &args.url,
                 &query_type,
@@ -887,6 +894,94 @@ async fn prewarm_indexes(
 /// the wire without per-row object allocation, matching how `psql` with `\timing` works.
 ///
 /// Returns `None` when `fail_on_error` is false and the query errors (the query is skipped).
+/// Dump pg_class + pg_stats info for all user tables in the public schema.
+/// Useful for comparing planner-input statistics across hosts.
+async fn capture_all_table_stats(url: &str) -> anyhow::Result<()> {
+    let mut conn = PgConnection::connect(url)
+        .await
+        .with_context(|| "Failed to connect for table stats")?;
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT relname FROM pg_class \
+         WHERE relkind = 'r' \
+           AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') \
+         ORDER BY relname",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .with_context(|| "Failed to list user tables")?;
+
+    for (table,) in tables {
+        println!("=== TABLE STATS BEGIN: {table} ===");
+        let class_q = format!(
+            "SELECT format('pg_class: relname=%s reltuples=%s relpages=%s relkind=%s', \
+                           relname, reltuples, relpages, relkind) \
+             FROM pg_class WHERE relname = '{table}'"
+        );
+        let rows: Vec<(String,)> = sqlx::query_as(&class_q).fetch_all(&mut conn).await?;
+        for (line,) in rows {
+            println!("{line}");
+        }
+        let stats_q = format!(
+            "SELECT format('pg_stats: col=%s null_frac=%s n_distinct=%s correlation=%s \
+                            avg_width=%s mcv=%s mcf=%s histogram=%s', \
+                           attname, null_frac, n_distinct, \
+                           COALESCE(correlation::text, 'NULL'), avg_width, \
+                           COALESCE(most_common_vals::text, 'NULL'), \
+                           COALESCE(most_common_freqs::text, 'NULL'), \
+                           COALESCE(histogram_bounds::text, 'NULL')) \
+             FROM pg_stats WHERE schemaname = 'public' AND tablename = '{table}' \
+             ORDER BY attname"
+        );
+        let rows: Vec<(String,)> = sqlx::query_as(&stats_q).fetch_all(&mut conn).await?;
+        for (line,) in rows {
+            println!("{line}");
+        }
+        println!("=== TABLE STATS END ===");
+    }
+    Ok(())
+}
+
+/// Capture EXPLAIN (ANALYZE, BUFFERS, VERBOSE) of the query and print to stdout.
+/// For multi-statement queries (e.g. `SET ...; SELECT ...`), runs all but the last
+/// statement as setup, then EXPLAINs the final statement.
+async fn capture_explain_plan(
+    url: &str,
+    query_type: &str,
+    query: &str,
+) -> anyhow::Result<()> {
+    let mut conn = PgConnection::connect(url)
+        .await
+        .with_context(|| "Failed to connect for EXPLAIN")?;
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let parts: Vec<&str> = trimmed
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Ok(());
+    }
+    let (setup, main_parts) = parts.split_at(parts.len() - 1);
+    let main_query = main_parts[0];
+    for stmt in setup {
+        sqlx::raw_sql(stmt)
+            .execute(&mut conn)
+            .await
+            .with_context(|| format!("Failed to run setup stmt: {stmt}"))?;
+    }
+    let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS, VERBOSE) {main_query}");
+    let rows: Vec<(String,)> = sqlx::query_as(&explain_sql)
+        .fetch_all(&mut conn)
+        .await
+        .with_context(|| "EXPLAIN ANALYZE failed")?;
+    println!("=== EXPLAIN PLAN BEGIN: {query_type} ===");
+    for (line,) in rows {
+        println!("{line}");
+    }
+    println!("=== EXPLAIN PLAN END ===");
+    Ok(())
+}
+
 async fn execute_query_multiple_times(
     url: &str,
     query_type: &str,
