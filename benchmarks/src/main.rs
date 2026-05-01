@@ -353,7 +353,7 @@ async fn generate_markdown_output(
     write_benchmark_header(&mut file)?;
     write_test_info(&mut file, args, rows_display).await?;
     write_postgres_settings(&mut file, &args.url).await?;
-    for _ in 0..10 {
+    for _ in 0..5 {
         if !args.skip_setup {
             process_index_creation_md(&mut file, args).await?;
         }
@@ -365,7 +365,7 @@ async fn generate_markdown_output(
 async fn generate_csv_output(args: &CommonBenchmarkArgs, rows_display: &str) -> anyhow::Result<()> {
     write_test_info_csv(args, rows_display).await?;
     write_postgres_settings_csv(&args.url, &args.r#type).await?;
-    for _ in 0..10 {
+    for _ in 0..5 {
         if !args.skip_setup {
             process_index_creation_csv(args).await?;
         }
@@ -378,7 +378,7 @@ async fn generate_json_output(
     args: &CommonBenchmarkArgs,
     _rows_display: &str,
 ) -> anyhow::Result<()> {
-    for _ in 0..10 {
+    for _ in 0..5 {
         if !args.skip_setup {
             process_index_creation_json(args).await?;
         }

@@ -263,6 +263,7 @@ jobs:
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET wal_level = minimal;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET huge_pages = on;"
           sudo sysctl -w vm.nr_hugepages=10000
+          echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
 
       - name: Restart Postgres
         working-directory: pg_search/
