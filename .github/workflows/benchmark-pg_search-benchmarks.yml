@@ -289,6 +289,46 @@ jobs:
           cargo pgrx stop pg${{ env.pg_version }}
           cargo pgrx start pg${{ env.pg_version }}
 
+      - name: Capture host hardware fingerprint
+        shell: bash
+        run: |
+          echo "=== HOST FINGERPRINT BEGIN ==="
+          # AWS instance metadata (IMDSv2)
+          TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+          if [ -n "$TOKEN" ]; then
+            for key in instance-id instance-type placement/availability-zone placement/region ami-id; do
+              val=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$key" 2>/dev/null || echo "n/a")
+              echo "fingerprint.aws.${key}: $val"
+            done
+          fi
+          # CPU model + microcode + frequency
+          echo "fingerprint.cpu.model: $(grep -m1 'model name' /proc/cpuinfo | sed 's/.*: //')"
+          echo "fingerprint.cpu.microcode: $(grep -m1 microcode /proc/cpuinfo | sed 's/.*: //')"
+          echo "fingerprint.cpu.cpu_mhz: $(grep -m1 'cpu MHz' /proc/cpuinfo | sed 's/.*: //')"
+          echo "fingerprint.cpu.cores: $(nproc)"
+          echo "fingerprint.cpu.stepping: $(grep -m1 stepping /proc/cpuinfo | sed 's/.*: //')"
+          echo "fingerprint.cpu.flags_hash: $(grep -m1 flags /proc/cpuinfo | sed 's/.*: //' | sha256sum | cut -c1-16)"
+          # CPU vulnerability mitigations (Spectre/Meltdown/MDS/etc.)
+          for f in /sys/devices/system/cpu/vulnerabilities/*; do
+            [ -f "$f" ] && echo "fingerprint.vuln.$(basename $f): $(cat $f)"
+          done
+          # Frequency / power state
+          echo "fingerprint.cpu.scaling_driver: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null || echo n/a)"
+          echo "fingerprint.cpu.scaling_governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+          echo "fingerprint.cpu.intel_no_turbo: $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo n/a)"
+          # Kernel
+          echo "fingerprint.kernel: $(uname -r)"
+          echo "fingerprint.uptime_seconds: $(awk '{print int($1)}' /proc/uptime)"
+          # Memory
+          echo "fingerprint.memory.total_kb: $(grep -m1 MemTotal /proc/meminfo | awk '{print $2}')"
+          # NVMe / disk
+          if command -v nvme >/dev/null 2>&1; then
+            echo "fingerprint.nvme.devices:"
+            nvme list 2>/dev/null | sed 's/^/  /' || true
+          fi
+          lscpu 2>/dev/null | sed 's/^/lscpu: /' || true
+          echo "=== HOST FINGERPRINT END ==="
+
       - name: Benchmark "stackoverflow" Dataset (1M)
         if: >-
           github.event_name != 'pull_request' ||
