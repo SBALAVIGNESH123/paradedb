@@ -42,7 +42,7 @@ jobs:
     runs-on:
       # To configure the runners: https://runs-on.com/configuration/job-labels/#how-it-works (runs in us-east-1)
       - runs-on=${{ github.run_id }}
-      - family=z1d.metal
+      - family=m8gd.metal-24x
       - image=ubuntu24-full-x64
       - extras=s3-cache # See https://runs-on.com/caching/magic-cache/
       #- volume=500gb:gp3
@@ -263,7 +263,7 @@ jobs:
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET wal_level = minimal;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET huge_pages = on;"
           sudo sysctl -w vm.nr_hugepages=10000
-          echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+          # echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
 
       - name: Restart Postgres
         working-directory: pg_search/
