@@ -251,7 +251,7 @@ jobs:
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM RESET ALL;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET shared_preload_libraries = pg_search,pg_stat_statements;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET maintenance_work_mem = '12GB';"
-          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET shared_buffers = '128GB';"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET shared_buffers = '12GB';"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_parallel_workers = 8;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_worker_processes = 8;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_parallel_maintenance_workers = 8;"
@@ -263,7 +263,7 @@ jobs:
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET max_wal_senders = 0;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET wal_level = minimal;"
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET huge_pages = on;"
-          sudo sysctl -w vm.nr_hugepages=70000
+          sudo sysctl -w vm.nr_hugepages=10000
           # echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
 
       - name: Restart Postgres
