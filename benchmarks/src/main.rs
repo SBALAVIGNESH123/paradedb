@@ -942,11 +942,7 @@ async fn capture_all_table_stats(url: &str) -> anyhow::Result<()> {
 /// Capture EXPLAIN (ANALYZE, BUFFERS, VERBOSE) of the query and print to stdout.
 /// For multi-statement queries (e.g. `SET ...; SELECT ...`), runs all but the last
 /// statement as setup, then EXPLAINs the final statement.
-async fn capture_explain_plan(
-    url: &str,
-    query_type: &str,
-    query: &str,
-) -> anyhow::Result<()> {
+async fn capture_explain_plan(url: &str, query_type: &str, query: &str) -> anyhow::Result<()> {
     let mut conn = PgConnection::connect(url)
         .await
         .with_context(|| "Failed to connect for EXPLAIN")?;
@@ -1004,8 +1000,8 @@ async fn execute_query_multiple_times(
     let evict_query = "SELECT pg_buffercache_evict_all();";
 
     for i in 0..times {
-        sqlx::raw_sql(stats_reset_query).execute(&mut conn).await?;
         sqlx::raw_sql(evict_query).execute(&mut conn).await?;
+        sqlx::raw_sql(stats_reset_query).execute(&mut conn).await?;
         sqlx::raw_sql(query).execute(&mut conn).await?;
         let result: Result<(f64, f64, i64), _> =
             sqlx::query_as(stats_query).fetch_one(&mut conn).await;
