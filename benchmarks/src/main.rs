@@ -999,8 +999,8 @@ async fn execute_query_multiple_times(
     let stats_reset_query = "SELECT pg_stat_statements_reset();";
     let evict_query = "SELECT pg_buffercache_evict_all();";
 
+    sqlx::raw_sql(evict_query).execute(&mut conn).await?;
     for i in 0..times {
-        sqlx::raw_sql(evict_query).execute(&mut conn).await?;
         sqlx::raw_sql(stats_reset_query).execute(&mut conn).await?;
         sqlx::raw_sql(query).execute(&mut conn).await?;
         let result: Result<(f64, f64, i64), _> =
