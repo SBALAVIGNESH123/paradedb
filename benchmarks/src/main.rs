@@ -274,7 +274,7 @@ async fn run_benchmarks(args: &CommonBenchmarkArgs) -> anyhow::Result<Vec<QueryR
 
     println!("Vacuuming...");
     if args.vacuum {
-        sqlx::query("VACUUM FULL ANALYZE")
+        sqlx::query("ANALYZE")
             .execute(&mut utility_conn)
             .await
             .with_context(|| "Failed to vacuum")?;
