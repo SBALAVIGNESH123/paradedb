@@ -220,15 +220,6 @@ async fn process_index_creation(
     let mut conn = PgConnection::connect(&args.url)
         .await
         .with_context(|| "Failed to connect to database")?;
-
-    // EXPERIMENT: pick a random target_segment_count in [24, 72] for this iteration.
-    let target_row = sqlx::query("SELECT (24 + floor(random() * 49))::int AS n")
-        .fetch_one(&mut conn)
-        .await
-        .with_context(|| "Failed to pick random segment count")?;
-    let target_count: i32 = target_row.get(0);
-    println!("Iteration target_segment_count: {target_count}");
-
     let index_sql = format!("datasets/{}/create_index/{}.sql", args.dataset, args.r#type);
     let mut results = Vec::new();
 
@@ -236,21 +227,10 @@ async fn process_index_creation(
         println!("{statement}");
 
         let start = Instant::now();
-        if statement.trim_start().starts_with("CREATE") {
-            // Set the GUC in the same exec as CREATE INDEX so it actually applies.
-            let combined = format!(
-                "SET paradedb.global_target_segment_count = {target_count}; {statement}"
-            );
-            sqlx::raw_sql(&combined)
-                .execute(&mut conn)
-                .await
-                .with_context(|| "Failed to execute index creation SQL")?;
-        } else {
-            sqlx::query(&statement)
-                .execute(&mut conn)
-                .await
-                .with_context(|| "Failed to execute index creation SQL")?;
-        }
+        sqlx::query(&statement)
+            .execute(&mut conn)
+            .await
+            .with_context(|| "Failed to execute index creation SQL")?;
         let duration_min_ms = start.elapsed().as_secs_f64() / 60.0;
 
         if statement.trim().starts_with("CREATE") {
@@ -405,12 +385,10 @@ async fn generate_json_output(
     args: &CommonBenchmarkArgs,
     _rows_display: &str,
 ) -> anyhow::Result<()> {
-    for _ in 0..20 {
-        if !args.skip_setup {
-            process_index_creation_json(args).await?;
-        }
-        run_benchmarks_json(args).await?;
+    if !args.skip_setup {
+        process_index_creation_json(args).await?;
     }
+    run_benchmarks_json(args).await?;
     Ok(())
 }
 

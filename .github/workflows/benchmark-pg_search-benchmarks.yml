@@ -283,7 +283,10 @@ jobs:
         working-directory: pg_search/
         run: |
           psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "CREATE EXTENSION IF NOT EXISTS pg_search;"
-          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET paradedb.global_target_segment_count = 48";
+          # EXPERIMENT: pick a random target_segment_count in [24, 72] per workflow run
+          TARGET=$((24 + RANDOM % 49))
+          echo "EXPERIMENT_target_segment_count=$TARGET"
+          psql postgresql://localhost:288${{ env.pg_version }}/postgres -c "ALTER SYSTEM SET paradedb.global_target_segment_count = $TARGET";
 
       - name: Restart Postgres
         working-directory: pg_search/
