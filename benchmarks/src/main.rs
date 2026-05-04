@@ -274,10 +274,16 @@ async fn run_benchmarks(args: &CommonBenchmarkArgs) -> anyhow::Result<Vec<QueryR
 
     println!("Vacuuming...");
     if args.vacuum {
-        sqlx::query("ANALYZE")
+        sqlx::query("VACUUM FULL ANALYZE")
             .execute(&mut utility_conn)
             .await
             .with_context(|| "Failed to vacuum")?;
+    }
+
+    // Capture index sizes/segments AFTER vacuum to compare with the pre-vacuum
+    // "Index built: ..." lines printed during process_index_creation.
+    if let Err(err) = capture_index_sizes(&args.url).await {
+        eprintln!("WARNING: capture_index_sizes failed: {err}");
     }
 
     if args.prewarm {
@@ -892,6 +898,43 @@ async fn prewarm_indexes(
 /// the wire without per-row object allocation, matching how `psql` with `\timing` works.
 ///
 /// Returns `None` when `fail_on_error` is false and the query errors (the query is skipped).
+/// Dump current pg_relation_size + paradedb.index_info() segment count for every
+/// user index in the public schema. Print as "Index post-vacuum: NAME size=NMB segments=N"
+/// for easy diff-vs-"Index built:" lines from process_index_creation.
+async fn capture_index_sizes(url: &str) -> anyhow::Result<()> {
+    let mut conn = PgConnection::connect(url)
+        .await
+        .with_context(|| "Failed to connect for post-vacuum index sizes")?;
+    let indexes: Vec<(String,)> = sqlx::query_as(
+        "SELECT relname FROM pg_class \
+         WHERE relkind = 'i' \
+           AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') \
+         ORDER BY relname",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .with_context(|| "Failed to list user indexes")?;
+    for (idx,) in indexes {
+        let size_row: (i64,) = sqlx::query_as(&format!(
+            "SELECT pg_relation_size('{idx}') / (1024 * 1024)"
+        ))
+        .fetch_one(&mut conn)
+        .await?;
+        let size_mb = size_row.0;
+        let seg_row: Result<(i64,), _> = sqlx::query_as(&format!(
+            "SELECT count(*) FROM paradedb.index_info('{idx}')"
+        ))
+        .fetch_one(&mut conn)
+        .await;
+        let seg_str = match seg_row {
+            Ok((n,)) => format!("segments={n}"),
+            Err(_) => "segments=N/A".to_string(),
+        };
+        println!("Index post-vacuum: {idx} size={size_mb}MB {seg_str}");
+    }
+    Ok(())
+}
+
 /// Dump pg_class + pg_stats info for all user tables in the public schema.
 /// Useful for comparing planner-input statistics across hosts.
 async fn capture_all_table_stats(url: &str) -> anyhow::Result<()> {
