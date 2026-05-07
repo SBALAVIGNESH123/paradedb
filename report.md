@@ -363,7 +363,44 @@ The OTHER three candidate fixes I'd previously listed (per-stage DistributedTask
 
 The N=8/N=10 regression is pure DSM-init overhead: K=3 peer meshes × N² edges × 16 MiB/edge = 3 GiB at N=8, 4.8 GiB at N=10 of shm_mq queue allocations + `shm_mq_create` calls per query. Tuning concern (G7), not correctness — the K=4 path at N=8 produces correct results, just spends 4 seconds in setup before the query runs.
 
-### Architectural reconsideration — why the embedded shm_mq model doesn't scale linearly
+### G7-MT: multi-thread Tokio per PG worker — the actual path to linear scaling
+
+**Retracting an earlier claim.** I previously wrote that the embedded shm_mq model has a fundamental ceiling because each PG parallel worker is "pinned to one backend thread by pgrx." That framing was wrong. Each PG parallel worker IS a full OS process with all its cores available — the pgrx restriction is only that calls into Postgres FFI must happen on a single thread per process, not that compute is pinned to one thread.
+
+Industry-standard MPP engines (Spark, Presto, DataFusion-distributed) all share the same shape: separate OS process per worker, multi-thread compute within each, single dedicated thread for IO. There's no reason a PG parallel worker can't replicate that. Compute (HashJoinExec build/probe, RepartitionExec fan-out, AggregateExec) doesn't touch pgrx; only the leaf scans + shm_mq IO do.
+
+**The actual blocker we hit when I tried switching to multi-thread Tokio:**
+
+1. `pgrx-pg-sys 0.18` enforces "active thread" via `thread_check::check_active_thread()` invoked from `pg_guard_ffi_boundary`. Only ONE thread per process can call into Postgres via pgrx. Compute futures spawned on Tokio worker threads panic with `postgres FFI may not be called from multiple threads.` on the first `pg_sys::shm_mq_receive` call.
+2. `pgrx::guc::GucSetting<T>::get()` also goes through the active-thread check. So `crate::gucs::*` calls in scan-time code paths (e.g. `dynamic_filter_batch_size`, `hash_join_inlist_pushdown_max_size`) panic from compute threads.
+
+These are not fundamental — they're a pgrx invariant that we need to work around. Two viable mechanisms:
+
+**Mechanism A: FFI relay (gRPC-style).** Backend thread runs an "FFI service" task; compute threads send `(op, oneshot::Sender<Reply>)` messages and `await` replies. Service does the FFI call serially, replies. shm_mq calls are microseconds each, so a single FFI thread can serve millions of ops/sec — plenty of headroom for the workload.
+
+**Mechanism B: Direct extern "C" bypass.** Re-declare the shm_mq fast-path C symbols (`shm_mq_send`, `shm_mq_receive`) in our crate as raw `extern "C"`, bypassing the `pg_guard_ffi_boundary` wrapper entirely. PG's underlying functions are thread-safe (atomics + `SetLatch` which is documented async-signal-safe). For the BLOCKING shm_mq paths (the ones using `WaitLatch` + `CHECK_FOR_INTERRUPTS`), keep them on the backend thread.
+
+Both are viable. **Mechanism A is preferred** because it's the same pattern DataFusion-distributed already uses (everyone agrees on the design), it composes cleanly with future expansions (broadcast, coalesce, work units), and it doesn't require us to reason about Postgres internal thread-safety.
+
+**Phased implementation plan:**
+
+1. **GUC snapshot (4 hours).** Add a `GucSnapshot` struct with all GUCs the compute path reads (`mpp_debug`, `mpp_trace`, `dynamic_filter_batch_size`, `hash_join_inlist_pushdown_max_size`, `hash_join_inlist_pushdown_max_distinct_values`, `term_set_gallop_*`). Snapshot at backend thread on `exec_mpp_worker` entry, stash on `SessionConfig` extension. Replace `crate::gucs::FOO()` reads in compute paths with `ctx.session_config().get_extension::<GucSnapshot>().FOO`.
+
+2. **FFI service + relay channel (1-2 days).** Add `FfiService` task spawned on backend thread. Channel API: `enum FfiOp { ShmMqTrySend { ... }, ShmMqTryRecv { ... }, ... }`. New `ShmMqSenderRelay` / `ShmMqReceiverRelay` implementing async `BatchChannelSender` / `BatchChannelReceiver` traits that dispatch through the channel. Migrate `MppSender::send_batch_traced_*` to use async send.
+
+3. **Multi-thread Tokio in worker (4 hours).** Switch `exec_mpp_worker`'s runtime from `new_current_thread()` to `new_multi_thread().worker_threads(N)`. Spawn the FFI service on a `LocalSet` pinned to the backend thread so it always polls there. Compute fragments spawn on the multi-thread pool naturally.
+
+4. **Test correctness + bench (1 day).** Re-run pgrx regression at K=1 and K=3; bench at N=2/4/8/10 with `enable_mpp_postagg_shuffle=on`. Expected: linear scaling — each worker uses multiple cores, total throughput scales with N.
+
+Total estimate: ~3 days of focused work. The thread-tracking infrastructure already on origin (`prep(mpp): thread-tracking infra` commit, `mark_backend_thread()` + `is_on_backend_thread()`) is the first piece — it's a no-op today but every gate is wired correctly for the multi-thread case.
+
+**Already on origin:** the thread-tracking helpers (`050f400f2`) and the substrate G1–G5 (`a214b1f27`). Picking up G7-MT means landing the GUC snapshot + FFI relay + multi-thread runtime, then re-bumping the fork pin to drop the `!has_shuffle_ancestor` guard for K>1.
+
+Once G7-MT lands, K=3 at N=8 should scale (each PG worker uses ~4 cores, 8 workers × 4 cores = 32 cores effective, with proper compute parallelism instead of being serialized on one Tokio thread per worker).
+
+### Original architectural concern (now superseded by G7-MT plan above)
+
+
 
 **Empirical scaling data (25 M `aggregate_join_groupby`, K=3 with segment slicing):**
 
