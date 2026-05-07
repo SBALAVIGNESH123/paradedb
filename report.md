@@ -306,8 +306,9 @@ The runtime substrate for K peer meshes is now in place on `moe/mpp-rpc-05-aggre
 | G2   | Stage-id-keyed transport routing: `CompositeWorkerTransport` holds `Arc<RwLock<HashMap<usize, Arc<MppPeerMesh>>>>` populated after the worker physical plan is built.                                                 | DONE          |
 | G3   | K-fragment runner: `exec_mpp_worker` walks `collect_inner_producer_fragments` and spawns one `run_inner_producer_fragment` per nested cross-worker shuffle (`K+1` concurrent futures via `try_join_all`).             | DONE          |
 | G4   | Drop fork's `!has_shuffle_ancestor` guard. **Reverted** — see findings below.                                                                                                                                         | BLOCKED on G5 |
-| G5   | Per-stage `DistributedTaskContext` so different stages can have different `consumer_tc`.                                                                                                                              | NOT STARTED   |
+| G5   | Build-cache replication fix: segment-slice the non-partitioning source per worker in peer-shuffle mode instead of all-gather. **DONE** (commit `a214b1f27`).                                                              | DONE          |
 | G6   | Multi-shuffle bench shape (3-way join + GROUP BY) for end-to-end validation.                                                                                                                                          | NOT STARTED   |
+| G7   | Tame the K×N² DSM init cost at high N. Either lower default `mpp_peer_queue_bytes` or switch to adaptive sizing per-stage. K=3 at N=8/N=10 currently regresses (5s/4s vs ~800ms K=1 baseline) purely on shm_mq queue setup. | NOT STARTED   |
 
 **G4 finding — running it on the bench surfaced a hard correctness bug.** With the guard dropped, the planner emits peer-mesh boundaries for the join-side hash repartitions. The 25 M `aggregate_join_groupby` bench returned `total_count = N × correct` — every row counted N times (4× at N=4 producers, 10× at N=10).
 
@@ -349,16 +350,18 @@ Edge case: at low producer counts (N=2 with the existing >=3 gate), single-worke
 
 The OTHER three candidate fixes I'd previously listed (per-stage DistributedTaskContext, per-stage iteration slice, disable broadcast in peer-shuffle) are not needed — the build-cache replication is the actual culprit. The substrate G1–G3 + the peer-mesh transport routing are correct; only the build-cache interaction was wrong.
 
-**Current shipping state (post-revert):** `moe/mpp-rpc-05-aggregate-activation` at `64f4fe077`, fork at `d954bed`. The `!has_shuffle_ancestor` guard is back in place — only the post-agg shuffle is peer-mesh-promoted, all other nested shuffles continue to elide as in-process. Substrate G1–G3 is parameterized over K but currently exercised at K=1. Bench at K=1:
+**Current shipping state:** `moe/mpp-rpc-05-aggregate-activation` at `a214b1f27`, fork at `19f9527` (guard dropped). Substrate G1–G5 is fully wired and exercised at K=3 (post-agg + 2 join-side peer meshes for the bench query). Bench:
 
-| N producers | Baseline (postagg=off) | New (postagg=on) |  Speedup |
-| ----------: | ---------------------: | ---------------: | -------: |
-|           2 |                3065 ms |      **1127 ms** | **2.7×** |
-|           4 |                 828 ms |           802 ms |    1.03× |
-|           8 |                 808 ms |           811 ms |    ~1.0× |
-|          10 |                 852 ms |           833 ms |    1.02× |
+| N producers | Baseline (postagg=off, K=0) | New (postagg=on, K=3) | Speedup    |
+| ----------: | --------------------------: | --------------------: | ---------: |
+|           2 |                     2947 ms |          **1126 ms** | **2.6×**   |
+|           4 |                      798 ms |           **695 ms** | **1.15×**  |
+|           8 |                      798 ms |              5246 ms | 0.15× (regression) |
+|          10 |                      819 ms |              3831 ms | 0.21× (regression) |
 
-Same plateau pattern as before: big win at N=2 (leader-serial `FinalPartitioned` is the bottleneck), modest 3% win at N=4, plateau at ~800 ms for N≥8 (some other downstream bottleneck — probably the inner `RepartitionExec(Hash, N²)` fan-out cost or shm_mq throughput on the doubled queue grid).
+**N=4 finally beats the K=1 plateau — the first win past 800 ms in the entire MPP roadmap.** Byte-exact correctness at every N. Result tuple `(1250000, 25000000, 204787074592)` matches across all configurations.
+
+The N=8/N=10 regression is pure DSM-init overhead: K=3 peer meshes × N² edges × 16 MiB/edge = 3 GiB at N=8, 4.8 GiB at N=10 of shm_mq queue allocations + `shm_mq_create` calls per query. Tuning concern (G7), not correctness — the K=4 path at N=8 produces correct results, just spends 4 seconds in setup before the query runs.
 
 ### Generalizing — what stops us from K nested shuffles + arbitrary queries
 
