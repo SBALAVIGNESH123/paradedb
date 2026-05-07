@@ -309,17 +309,45 @@ The runtime substrate for K peer meshes is now in place on `moe/mpp-rpc-05-aggre
 | G5   | Per-stage `DistributedTaskContext` so different stages can have different `consumer_tc`.                                                                                                                              | NOT STARTED   |
 | G6   | Multi-shuffle bench shape (3-way join + GROUP BY) for end-to-end validation.                                                                                                                                          | NOT STARTED   |
 
-**G4 finding — running it on the bench surfaced a hard correctness bug.** With the guard dropped, the planner emits peer-mesh boundaries for the join-side hash repartitions of `HashJoinExec(Partitioned)` (or, with broadcast joins enabled, for any other nested cross-worker shuffle). The 25 M `aggregate_join_groupby` bench then returned `total_count = 250M` (vs the correct 25M) — every row counted N times.
+**G4 finding — running it on the bench surfaced a hard correctness bug.** With the guard dropped, the planner emits peer-mesh boundaries for the join-side hash repartitions. The 25 M `aggregate_join_groupby` bench returned `total_count = N × correct` — every row counted N times (4× at N=4 producers, 10× at N=10).
 
-Root cause: the post-aggregate inner producer fragment's `RepartitionExec(post-agg-Hash, N²)` is iterated `0..N²` times, and each iteration recursively triggers `HashJoinExec.execute(j)` → `NetworkShuffleExec(join-side).execute(j)`. With the join-side stage's `task_index = K` and `consumer_tc = N`, `off = N × K`, so the consumer asks for `stream_partition(N×K + j)` with `j ∈ 0..N²`. That requests partitions far outside the consumer's slice, which empty-streams _most_ of them — but with `HashJoinExec(CollectLeft)` plus `with_distributed_broadcast_joins(true)`, the build side is collected once across all probe partitions per worker, and each of N workers ends up with a full broadcast build. Each worker then produces a full join output, so the post-aggregate consumes N copies of the data.
+**Root cause confirmed by `mpp_debug` plan dump (N=4):**
 
-Fix path (deferred to G5):
+```text
+DistributedExec
+  CoalescePartitionsExec
+    [Stage 4] => NetworkShuffleExec: output_partitions=4, input_tasks=4   ← OUTER gather
+      AggregateExec: mode=FinalPartitioned, gby=[title]
+        [Stage 3] => NetworkShuffleExec: output_partitions=4, input_tasks=4   ← post-agg peer mesh
+          RepartitionExec: partitioning=Hash([title], 16)
+            AggregateExec: mode=Partial
+              ProjectionExec
+                HashJoinExec: mode=Partitioned, on=(id, file_id)
+                  [Stage 1] => NetworkShuffleExec: output_partitions=4, input_tasks=4   ← build-side peer mesh
+                    RepartitionExec: partitioning=Hash([id], 16)
+                      DataSourceExec: partitions=4   ← FULL files data per worker (build cache all-gather)
+                  [Stage 2] => NetworkShuffleExec: output_partitions=4, input_tasks=4   ← probe-side peer mesh
+                    RepartitionExec: partitioning=Hash([file_id], 16)
+                      PgSearchScan
+```
 
-1. Each cross-worker shuffle stage needs its OWN `DistributedTaskContext` so `NetworkShuffleExec.execute(j)` reads the correct `task_index` for its stage. Today the worker's session has a single `task_index = worker_idx` extension, conflated across all stages.
-2. The inner producer fragment runner needs to iterate only the _task's slice_ of output partitions (`n_partitions / consumer_tc`), not the full scaled count. With `consumer_tc=N` and `partitions=N²`, that's `N` iterations per task — matching the join-side's per-task partition ownership.
-3. (Optional) Disable broadcast joins in the in-process peer-shuffle path, or tag each broadcast separately so `LocalExecWorkerTransport` still handles them while peer-mesh shuffles go through `ShmMqPeerWorkerTransport`.
+The `DataSourceExec` feeding `RepartitionExec(Hash([id]))` is the build-side cache (`MemoryExec` from the all-gather DSM region) — every PG worker has the **full** 1.25 M files data after the all-gather barrier. Each worker independently runs `RepartitionExec(Hash([id], 16))` on its full copy, so for each hash bucket B every producer P emits the SAME data into peer-mesh slot `(P → consumer floor(B/N))`. The consumer reads from N producers and gets N copies of the same data per hash bucket.
 
-These are mechanical changes once we agree on the design, but each touches both the fork (per-stage DistributedTaskContext via `Stage` extension) and pg_search (per-mesh iteration logic in `run_inner_producer_fragment`). Estimate: ~200 LOC across both.
+The build-cache all-gather was added for `HashJoinExec(CollectLeft)` broadcast semantics, where every worker needs the full build. With peer-shuffle enabled the planner picks `HashJoinExec(Partitioned)` instead, and the all-gather becomes a correctness bug.
+
+**Fix path (concrete):**
+
+In peer-shuffle mode, the non-partitioning source (files) must be **segment-sliced per worker** instead of all-gather replicated. Each worker scans its 1/N segment slice of files, hashes its slice, and the peer mesh redistributes — same model the partitioning source already uses for pages.
+
+Implementation (~50–80 LOC):
+
+1. `pg_search/src/scan/table_provider.rs` — when the GUC `enable_mpp_postagg_shuffle` is on, skip the build-cache code path. Each worker's `PgSearchTableProvider::scan` should iterate its assigned segments only (via `parallel_state.checkout_segment` already used by the partitioning source).
+2. `aggregatescan/mod.rs` — when `enable_mpp_postagg_shuffle` is on, set `n_cache_sources = 0` in `estimate_dsm_size` + `leader_setup` so DSM doesn't reserve the cache region.
+3. Once (1) and (2) land, drop the fork's `!has_shuffle_ancestor` guard and re-run the bench. Expected: byte-exact correctness at every K, with the K>1 perf benefit (parallel HashJoin per worker on its segment slice).
+
+Edge case: at low producer counts (N=2 with the existing >=3 gate), single-worker join may have no parallelism; verify the cost model still picks Partitioned join over a serial fallback.
+
+The OTHER three candidate fixes I'd previously listed (per-stage DistributedTaskContext, per-stage iteration slice, disable broadcast in peer-shuffle) are not needed — the build-cache replication is the actual culprit. The substrate G1–G3 + the peer-mesh transport routing are correct; only the build-cache interaction was wrong.
 
 **Current shipping state (post-revert):** `moe/mpp-rpc-05-aggregate-activation` at `64f4fe077`, fork at `d954bed`. The `!has_shuffle_ancestor` guard is back in place — only the post-agg shuffle is peer-mesh-promoted, all other nested shuffles continue to elide as in-process. Substrate G1–G3 is parameterized over K but currently exercised at K=1. Bench at K=1:
 
