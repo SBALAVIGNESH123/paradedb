@@ -363,6 +363,69 @@ The OTHER three candidate fixes I'd previously listed (per-stage DistributedTask
 
 The N=8/N=10 regression is pure DSM-init overhead: K=3 peer meshes × N² edges × 16 MiB/edge = 3 GiB at N=8, 4.8 GiB at N=10 of shm_mq queue allocations + `shm_mq_create` calls per query. Tuning concern (G7), not correctness — the K=4 path at N=8 produces correct results, just spends 4 seconds in setup before the query runs.
 
+### Architectural reconsideration — why the embedded shm_mq model doesn't scale linearly
+
+**Empirical scaling data (25 M `aggregate_join_groupby`, K=3 with segment slicing):**
+
+| N producers | K=0 (postagg=off) | K=1 (postagg=on, guard) | K=3 (postagg=on, guard dropped) | Notes |
+|---:|---:|---:|---:|---|
+| 2 | ~3000 ms | ~1130 ms | ~1130 ms | Same — leader-serial finalize is the floor at low N |
+| 4 | 860 ms | 800 ms | **685 ms** | K=3 wins (1.25× over K=0) |
+| 8 | 850 ms | 810 ms | **6300 ms** | K=3 collapses |
+| 10 | 820 ms | 830 ms | 3800 ms | K=3 collapses |
+
+Sweep on `mpp_peer_queue_bytes` at N=8 K=3: 1 MiB → 6800 ms; 4 MiB → 6370 ms; 16 MiB → 5250 ms; 32 MiB → 6500 ms. **Queue size is not the knob.** DSM init isn't the bottleneck either (allocations + `shm_mq_create` are sub-millisecond per slot). The high-N collapse is something else — most likely a combination of (a) the cooperative-drain pass on the worker's single Tokio thread touching K×N inbound queues + K stages × N partitions of demux work per pass, (b) producer-side fan-out spanning K concurrent fragment runners that all share that one thread, and (c) shm_mq backpressure interactions across K multiplexed stages. Untangling exactly which is dominant would need worker-side `tracing::span` instrumentation, but the structural problem is independent of the specific bottleneck: **adding peer-mesh stages adds work to a single backend thread that already runs the full producer-fragment pipeline for one PG worker.**
+
+**Fundamental limit of the embedded model.** Each PG parallel worker is one OS process pinned to one backend thread by pgrx. To deliver MPP we make that thread:
+
+1. Run K+1 DataFusion fragment producer loops concurrently on a current-thread Tokio runtime.
+2. Drive K cooperative drain handles for inbound peer-mesh data (each demuxing N producers × N partitions tags).
+3. Push outbound batches through K outbound shm_mq sender sets (N senders per set).
+4. Service the leader-bound mesh's outbound senders.
+
+At low N (2–4) the work fits on the thread. At N=8+ the per-worker work compounds super-linearly — this is the fundamental ceiling. Tuning per-edge queue sizes can't move it; the bottleneck is CPU concurrency on a single PG-worker thread, not memory bandwidth or DSM bytes.
+
+**What linear-scaling MPP actually looks like (industry standard).**
+
+Apache Spark, Presto/Trino, Snowflake, BigQuery, and the upstream `datafusion-distributed` design all share one shape:
+
+- **Each task runs in its own OS process** with its own thread pool. N tasks per stage = N processes (or container slots).
+- **Inter-stage transport is dynamic.** Each producer→consumer stream is a gRPC/HTTP-2 stream opened on demand and torn down after the stage completes. No N² pre-allocated channels per query — the runtime opens streams as `NetworkShuffleExec.execute` calls into the transport.
+- **Coordinator is separate from workers.** A query coordinator sends per-task plan slices to workers, collects results, never participates in shuffle hot-paths.
+- **Workers are long-lived.** A worker process boots once, holds its session/runtime, accepts per-query work via the coordinator. Per-query setup is just plan deserialization + stream setup.
+
+Crucially, **the coordinator has no bound on per-task or per-stage CPU consumption**. Each task gets dedicated cores. Scaling N=8 → N=16 means 16 worker processes, 16× cores, 16× IO threads. Linear.
+
+**Why our embedded model can't replicate that within PostgreSQL parallel workers:**
+
+1. **PG parallel workers are forked from postmaster** — their memory + lifecycle is tightly coupled to the leader's transaction. We can't grow the worker pool dynamically per stage.
+2. **pgrx pins each backend to one thread** for shm_mq FFI safety. Multi-stage concurrency on one thread means shared CPU.
+3. **DSM regions are one-shot allocated** at parallel-context init. We can't open new shm_mq queues mid-query without a custom dynamic shared-memory allocator.
+4. **PG's parallel framework expects workers to be largely independent** (each producer-consumer pair, not all-to-all meshes).
+
+The embedded model can deliver the K=1 post-aggregate parallelization (~1.5–2×) cleanly and has — that's a genuine win that's already on `moe/mpp-rpc-05-aggregate-activation` and behind a default-off GUC. **Anything beyond K=1 hits a fundamental wall at N≥8 that no tactical fix will move.**
+
+**Path to true linear scaling — separate worker pool ("ParadeDB cluster mode").**
+
+The right way to get the DF-D-style linear scaling:
+
+1. **Spin up a separate ParadeDB worker pool** alongside (not inside) PostgreSQL. Workers are long-lived OS processes (managed via systemd / kubernetes / etc), each running an embedded DataFusion runtime + `pg_search`'s table providers configured to scan PG's index files via direct mmap or a server-side handle.
+2. **The PG backend acts as the coordinator.** When MPP activates, the customscan serializes the logical plan, dispatches it to the worker pool via gRPC, streams results back via the existing fork's `FlightWorkerTransport`. No PG parallel workers, no DSM, no shm_mq.
+3. **The worker pool uses the upstream fork as-is** — every gRPC, scaling, and stream-management mechanism the fork already implements lights up. The N² peer-mesh problem disappears because each worker is a separate process and gRPC streams open dynamically.
+4. **Reuse pg_search's existing read path for index access.** Workers connect to PG via `libpq` or read index files from disk (Tantivy index files are designed for shared/concurrent reads).
+
+Cost estimate: this is a ~3-month engineering project, not a tactical fix. It requires:
+- Worker pool lifecycle management (process supervision, IPC, health checks, scaling).
+- Auth/TLS between PG and workers.
+- Schema/catalog sync (workers need to know which indexes are available).
+- Result streaming back to PG via the existing `DataSourceExec` interface.
+- Configuration story (cluster vs single-node).
+- Operational runbook (monitoring, recovery from worker crashes).
+
+**Recommendation.** Ship what's already on origin (K=1 with default-off GUC) as the embedded MPP for users who want a free 1.5–2× on aggregate-on-join queries with no operational overhead. Document the ceiling. For users who actually need linear scaling on multi-billion-row queries, build out the cluster-mode worker pool — that's where the real wins live, and the upstream fork already does most of the heavy lifting.
+
+Anything else (more tactical fixes on the embedded shm_mq model, K>1 substrate work, additional knobs) is fighting against the fundamental ceiling.
+
 ### Generalizing — what stops us from K nested shuffles + arbitrary queries
 
 The current substrate is hard-coded for K=1 nested cross-worker shuffle (the post-aggregate one). To go fully generic — multiple peer meshes per query, arbitrary plan shapes — five concrete blockers, in increasing scope:
