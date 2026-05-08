@@ -19,7 +19,7 @@ runs:
         path: bench-temp
         token: ${{ inputs.github-token }}
         fetch-depth: 1
-        ref: main
+        ref: ${{ github.ref }}
 
     - name: Copy latest benchmarks into place
       shell: bash
