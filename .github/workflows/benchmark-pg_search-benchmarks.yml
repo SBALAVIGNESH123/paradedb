@@ -123,7 +123,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
           #ref: main
-          ref: github.ref
+          ref: ${{ github.ref }}
 
       - name: Copy latest actions into place
         #if: >-
