@@ -62,7 +62,7 @@ runs:
     # we sleep for a random number of seconds to hopefully avoid conflicting with other concurrent
     # benchmark-action publish actions running in other jobs
     - name: Sleep before publish
-      if: github.ref == 'refs/heads/main'
+      # if: github.ref == 'refs/heads/main'
       shell: bash
       run: echo $(( 1 + RANDOM % ( 61 - 1 + 1 ) ))
 
@@ -76,7 +76,8 @@ runs:
         github-token: ${{ inputs.github_token }}
         gh-repository: github.com/${{ github.repository }}
         gh-pages-branch: gh-pages
-        auto-push: ${{ github.ref == 'refs/heads/main' }}
+        #auto-push: ${{ github.ref == 'refs/heads/main' }}
+        auto-push: true
         benchmark-data-dir-path: benchmarks
         alert-threshold: "115%"
         comment-on-alert: true # We comment and alert rather than failing, as we have both Github and Slack messages to notify us
