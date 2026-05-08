@@ -136,12 +136,12 @@ jobs:
         run: rm -rf actions-temp
 
       # always fetch the code from main, unless we've explicitly overridden that, or triggered this via label (like you would on a PR)
-      #- name: Fetch latest benchmark code, suites
-      #if: >-
-      #  !inputs.use_benchmarks_from_ref && !contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
-      #  uses: ./.github/actions/benchmarks-from-main
-      #  with:
-      #    github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch latest benchmark code, suites
+        #if: >-
+        #  !inputs.use_benchmarks_from_ref && !contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
+        uses: ./.github/actions/benchmarks-from-main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Resolve git ref to PR
         id: pr_label
