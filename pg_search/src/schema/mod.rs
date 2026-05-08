@@ -211,7 +211,8 @@ fn derive_field_type_from_schema(
     });
 
     // For most types, the tantivy schema matches what we computed.
-    // The exception is NUMERIC, where legacy indexes used F64 but new code computes Numeric64/NumericBytes.
+    // The exceptions are:
+    // - NUMERIC, where legacy indexes used F64 but new code computes Numeric64/NumericBytes.
     match field_entry.field_type() {
         FieldType::F64(_) => {
             // If computed type was Numeric64/NumericBytes but stored type is F64,
@@ -307,11 +308,12 @@ impl TryFrom<(PgOid, Typmod, pg_sys::Oid)> for SearchFieldType {
                 | PgBuiltInOids::DATERANGEOID
                 | PgBuiltInOids::TSRANGEOID
                 | PgBuiltInOids::TSTZRANGEOID => Ok(SearchFieldType::Range((*builtin).into())),
-                PgBuiltInOids::DATEOID
-                | PgBuiltInOids::TIMESTAMPOID
-                | PgBuiltInOids::TIMESTAMPTZOID
-                | PgBuiltInOids::TIMEOID
-                | PgBuiltInOids::TIMETZOID => Ok(SearchFieldType::Date((*builtin).into())),
+                PgBuiltInOids::TIMESTAMPOID | PgBuiltInOids::TIMESTAMPTZOID => {
+                    Ok(SearchFieldType::I64((*builtin).into()))
+                }
+                PgBuiltInOids::DATEOID | PgBuiltInOids::TIMEOID | PgBuiltInOids::TIMETZOID => {
+                    Ok(SearchFieldType::Date((*builtin).into()))
+                }
                 _ => Err(SearchIndexSchemaError::InvalidPgOid(pg_oid)),
             },
             PgOid::Custom(custom) if unsafe { pgrx::pg_sys::type_is_enum(*custom) } => {

@@ -812,6 +812,12 @@ pub unsafe fn row_to_search_document<'a>(
                 SearchFieldType::F64(oid) if oid == pg_sys::NUMERICOID => {
                     TantivyValue::try_from_numeric_f64(actual_datum)
                 }
+                SearchFieldType::Date(oid) if oid == pg_sys::TIMESTAMPOID => {
+                    TantivyValue::try_from_timestamp_date(actual_datum)
+                }
+                SearchFieldType::Date(oid) if oid == pg_sys::TIMESTAMPTZOID => {
+                    TantivyValue::try_from_timestamptz_date(actual_datum)
+                }
                 _ => TantivyValue::try_from_datum(actual_datum, *base_oid),
             }
             .unwrap_or_else(|e| {
