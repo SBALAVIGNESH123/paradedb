@@ -853,6 +853,19 @@ impl TantivyValue {
         )?))
     }
 
+    pub unsafe fn try_from_timestamptz_array_date(
+        datum: Datum,
+    ) -> Result<Vec<Self>, TantivyValueError> {
+        let array: pgrx::Array<Datum> =
+            pgrx::Array::from_datum(datum, false).ok_or(TantivyValueError::DatumDeref)?;
+
+        array
+            .into_iter()
+            .flatten()
+            .map(|element_datum| Self::try_from_timestamptz_date(element_datum))
+            .collect()
+    }
+
     #[allow(static_mut_refs)]
     pub unsafe fn try_from_timestamp_date(datum: Datum) -> Result<Self, TantivyValueError> {
         use crate::postgres::datetime::micros_to_tantivy_datetime;
@@ -868,6 +881,19 @@ impl TantivyValue {
         let tantivy_date = micros_to_tantivy_datetime(micros)?;
 
         Ok(TantivyValue(OwnedValue::Date(tantivy_date)))
+    }
+
+    pub unsafe fn try_from_timestamp_array_date(
+        datum: Datum,
+    ) -> Result<Vec<Self>, TantivyValueError> {
+        let array: pgrx::Array<Datum> =
+            pgrx::Array::from_datum(datum, false).ok_or(TantivyValueError::DatumDeref)?;
+
+        array
+            .into_iter()
+            .flatten()
+            .map(|element_datum| Self::try_from_timestamp_date(element_datum))
+            .collect()
     }
 
     /// Convert a PostgreSQL NUMERIC[] array to TantivyValues with I64 fixed-point storage.

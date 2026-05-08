@@ -210,18 +210,22 @@ fn derive_field_type_from_schema(
         panic!("`{field_name}`'s configuration not found in index WITH options")
     });
 
+    // This looks for patterns of (tantivy schema type, computed type with postgres type) that
+    // need special handling to support backwards-compatible changes in how postgres types are
+    // stored
     // For most types, the tantivy schema matches what we computed.
     // The exceptions are:
     // - NUMERIC, where legacy indexes used F64 but new code computes Numeric64/NumericBytes.
-    match field_entry.field_type() {
-        FieldType::F64(_) => {
-            // If computed type was Numeric64/NumericBytes but stored type is F64,
-            // this is a legacy index - use F64
-            if computed_type.is_numeric() {
-                SearchFieldType::F64(computed_type.typeoid().value())
-            } else {
-                computed_type
-            }
+    // - TIMESTAMP and TIMESTAMP WITH TIMEZONE. Legacy indexes stored these as Date, but new code
+    //   uses i64
+    match (field_entry.field_type(), computed_type) {
+        (FieldType::F64(_), _) if computed_type.is_numeric() => {
+            SearchFieldType::F64(computed_type.typeoid().value())
+        }
+        (FieldType::Date(_), SearchFieldType::I64(oid))
+            if oid == pg_sys::TIMESTAMPOID || oid == pg_sys::TIMESTAMPTZOID =>
+        {
+            SearchFieldType::Date(computed_type.typeoid().value())
         }
         _ => {
             // For all other types, the computed type is correct
