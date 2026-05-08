@@ -1,0 +1,97 @@
+name: Benchmark - Queries
+description: Run a given benchmark dataset against pg_search and publish metrics
+
+inputs:
+  dataset:
+    description: "The benchmark dataset to run (e.g. logs, docs, stackoverflow)"
+    required: true
+  size:
+    description: "Size label for pre-sampled dataset, e.g. '100k', '1m', '20m'"
+    required: true
+  ref:
+    description: "Git ref or short SHA to report in benchmarks"
+    required: true
+  github_token:
+    description: "GitHub token to authenticate with"
+    required: true
+  slack_oauth_token:
+    description: "Slack OAuth token to authenticate with"
+    required: true
+  slack_channel:
+    description: "Slack channel to post results to"
+    required: true
+  pr_label:
+    description: "The human readable version of the commit being tested"
+    required: true
+  fail_on_error:
+    description: "Whether to fail on query errors. Set to 'false' for backfills against older versions."
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run Benchmarks
+      working-directory: benchmarks/
+      shell: bash
+      run: |
+        POSTGRES_URL="postgresql://localhost:288${{ env.pg_version }}/postgres"
+
+        # Pre-sampled dataset loaded from S3.
+        cargo run --release -- benchmark \
+          --url "${POSTGRES_URL}" \
+          --size ${{ inputs.size }} \
+          --dataset ${{ inputs.dataset }} \
+          --data-source s3://paradedb-ci-benchmarks/datasets/${{ inputs.dataset }}/ \
+          --runs 10 \
+          --output json \
+          --fail-on-error ${{ inputs.fail_on_error }}
+
+        echo "ROWS_LABEL=${{ inputs.size }}" >> $GITHUB_ENV
+
+    - name: Print the Postgres Logs
+      if: failure()
+      shell: bash
+      run: cat ~/.pgrx/${{ env.pg_version }}.log
+
+    # Necessary to avoid "destination path is not empty" error
+    - name: Cleanup Previous Benchmark Publish Working Directory
+      shell: bash
+      run: rm -rf ./benchmark-data-repository
+
+    # we sleep for a random number of seconds to hopefully avoid conflicting with other concurrent
+    # benchmark-action publish actions running in other jobs
+    - name: Sleep before publish
+      # if: github.ref == 'refs/heads/main'
+      shell: bash
+      run: echo $(( 1 + RANDOM % ( 61 - 1 + 1 ) ))
+
+    - name: Publish Benchmark Metrics
+      uses: benchmark-action/github-action-benchmark@v1
+      with:
+        name: "pg_search '${{ inputs.dataset }}' (${{ env.ROWS_LABEL }} rows)"
+        ref: ${{ inputs.ref }}
+        tool: customSmallerIsBetter
+        output-file-path: benchmarks/results.json
+        github-token: ${{ inputs.github_token }}
+        gh-repository: github.com/${{ github.repository }}
+        gh-pages-branch: gh-pages
+        #auto-push: ${{ github.ref == 'refs/heads/main' }}
+        auto-push: true
+        benchmark-data-dir-path: benchmarks
+        alert-threshold: "115%"
+        comment-on-alert: true # We comment and alert rather than failing, as we have both Github and Slack messages to notify us
+        alert-comment-cc-users: "@${{ github.actor }}"
+        comment-always: ${{ github.event_name == 'pull_request' }}
+
+    - name: Upload Benchmark Results to Slack (push only)
+      if: github.ref == 'refs/heads/main'
+      uses: slackapi/slack-github-action@v3
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack_oauth_token }}
+        payload: |
+          channel: ${{ inputs.slack_channel }}
+          text: |
+            ${{ github.repository }} Benchmark Results: `${{ inputs.dataset }}` (${{ env.ROWS_LABEL }} rows)
+            <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ inputs.pr_label }}> @ <https://paradedb.github.io/${{ github.event.repository.name }}/benchmarks/>
