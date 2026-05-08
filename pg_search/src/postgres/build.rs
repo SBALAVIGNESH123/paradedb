@@ -162,7 +162,8 @@ unsafe fn validate_index_config(index_relation: &PgSearchRelation) {
     for (field_name, config) in datetime_configs.iter().flatten() {
         validate_field_config(field_name, &key_field_name, config, options, |t| {
             matches!(t, SearchFieldType::Date(_))
-        });
+                || matches!(t, SearchFieldType::I64(oid) if *oid == pg_sys::TIMESTAMPOID || *oid == pg_sys::TIMESTAMPTZOID)
+        })
     }
 }
 
