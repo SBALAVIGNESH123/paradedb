@@ -678,10 +678,6 @@ fn count_peer_mesh_shuffles(
         Ok(b) => b,
         Err(_) => return 0,
     };
-    let state_builder = match state_builder.with_distributed_emit_peer_shuffles(true) {
-        Ok(b) => b,
-        Err(_) => return 0,
-    };
     let state_builder = state_builder
         .with_distributed_user_codec(PgSearchPhysicalCodecStub)
         .with_distributed_planner();
@@ -1207,8 +1203,6 @@ impl AggregateScan {
             .with_distributed_task_estimator(n_workers)
             .with_distributed_broadcast_joins(true)
             .expect("with_distributed_broadcast_joins")
-            .with_distributed_emit_peer_shuffles(gucs::enable_mpp_postagg_shuffle())
-            .expect("with_distributed_emit_peer_shuffles")
             .with_distributed_user_codec(PgSearchPhysicalCodecStub)
             .with_distributed_planner();
         datafusion::prelude::SessionContext::new_with_state(state_builder.build())
@@ -1414,8 +1408,6 @@ impl AggregateScan {
             .with_distributed_task_estimator(n_workers_us)
             .with_distributed_broadcast_joins(true)
             .expect("with_distributed_broadcast_joins")
-            .with_distributed_emit_peer_shuffles(gucs::enable_mpp_postagg_shuffle())
-            .expect("with_distributed_emit_peer_shuffles")
             .with_distributed_user_codec(PgSearchPhysicalCodecStub)
             .with_distributed_planner();
         let session_state = state_builder.build();
