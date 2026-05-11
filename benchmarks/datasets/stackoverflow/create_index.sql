@@ -17,7 +17,7 @@ USING bm25 (
     text_fields = '{
         "title": {"fast": true},
         "body": {"fast": true},
-        "tags": {"tokenizer": "keyword"},
+        "tags": {"tokenizer": {"type": "keyword"}},
         "owner_display_name": {"fast": true}
     }'
 );
@@ -49,7 +49,7 @@ USING bm25 (
     key_field = 'id',
     text_fields = '{
         "text": {"fast": true},
-        "user_display_name: {"tokenizer", "keyword"}
+        "user_display_name: {"tokenizer": {"type": "keyword"}},
     }'
 );
 
