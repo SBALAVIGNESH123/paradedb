@@ -18,7 +18,7 @@ USING bm25 (
         "title": {"fast": true},
         "body": {"fast": true},
         "tags": {"tokenizer": "keyword"},
-        "owner_display_name: {"fast": true}
+        "owner_display_name": {"fast": true}
     }'
 );
 
