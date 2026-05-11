@@ -49,7 +49,7 @@ USING bm25 (
     key_field = 'id',
     text_fields = '{
         "text": {"fast": true},
-        "user_display_name": {"tokenizer": {"type": "keyword"}},
+        "user_display_name": {"tokenizer": {"type": "keyword"}}
     }'
 );
 
