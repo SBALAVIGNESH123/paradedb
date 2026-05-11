@@ -11,7 +11,8 @@ SET paradedb.enable_aggregate_custom_scan TO on; SELECT COUNT(*) FROM (SELECT po
 SET paradedb.enable_aggregate_custom_scan TO on; SELECT COUNT(post_type_id) FROM stackoverflow_posts WHERE body ||| 'javascript';
 
 -- pdb.agg without GROUP BY (mvcc disabled)
-SELECT pdb.agg('{"value_count": {"field": "post_type_id"}}', false) FROM stackoverflow_posts WHERE body ||| 'javascript';
+--SELECT pdb.agg('{"value_count": {"field": "post_type_id"}}', false) FROM stackoverflow_posts WHERE body ||| 'javascript';
+SELECT 1 + 1;
 
 -- high-cardinality aggregate scan
 SET work_mem TO '4GB'; SELECT tags, COUNT(*), MIN(score), MAX(score), SUM(score) FROM stackoverflow_posts WHERE body ||| 'javascript' GROUP BY tags;

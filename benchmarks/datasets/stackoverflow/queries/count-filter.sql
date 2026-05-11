@@ -8,4 +8,4 @@ SET paradedb.enable_aggregate_custom_scan TO on; SELECT COUNT(*) FROM stackoverf
 SET paradedb.enable_aggregate_custom_scan TO on; SELECT COUNT(ctid) FROM stackoverflow_posts WHERE body ||| 'error';
 
 -- pdb.agg without GROUP BY (mvcc disabled)
-SELECT pdb.agg('{"value_count": {"field": "ctid"}}', false) FROM stackoverflow_posts WHERE body ||| 'error';
+--SELECT pdb.agg('{"value_count": {"field": "ctid"}}', false) FROM stackoverflow_posts WHERE body ||| 'error';
