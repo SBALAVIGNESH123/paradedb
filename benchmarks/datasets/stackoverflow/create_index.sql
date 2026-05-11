@@ -17,7 +17,7 @@ USING bm25 (
     text_fields = '{
         "title": {"fast": true},
         "body": {"fast": true},
-        "tags": {"tokenizer": "keyword"}
+        "tags": {"tokenizer": "keyword"},
         "owner_display_name: {"fast": true}
     }'
 );
