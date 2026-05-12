@@ -774,6 +774,7 @@ fn term_set(
                 tantivy_field,
                 &term,
                 field_type,
+                &search_field_type,
                 field.path().as_deref(),
                 is_date_time,
             )
@@ -803,6 +804,7 @@ fn term(
         search_field.field(),
         &value,
         field_type,
+        &search_field_type,
         field.path().as_deref(),
         is_datetime,
     )?;
@@ -1494,6 +1496,7 @@ fn range(
             search_field.field(),
             &value,
             field_type,
+            &search_field_type,
             field.path().as_deref(),
             is_datetime,
         )?),
@@ -1501,6 +1504,7 @@ fn range(
             search_field.field(),
             &value,
             field_type,
+            &search_field_type,
             field.path().as_deref(),
             is_datetime,
         )?),
@@ -1512,6 +1516,7 @@ fn range(
             search_field.field(),
             &value,
             field_type,
+            &search_field_type,
             field.path().as_deref(),
             is_datetime,
         )?),
@@ -1519,6 +1524,7 @@ fn range(
             search_field.field(),
             &value,
             field_type,
+            &search_field_type,
             field.path().as_deref(),
             is_datetime,
         )?),
@@ -1570,6 +1576,7 @@ fn tokenized_phrase(
             search_field.field(),
             &value,
             field_type,
+            &search_field.field_type(),
             path.as_deref(),
             false,
         )?;
@@ -1606,6 +1613,7 @@ fn phrase_prefix(
             search_field.field(),
             &OwnedValue::Str(phrase),
             field_type,
+            &search_field.field_type(),
             field.path().as_deref(),
             false,
         )
@@ -1645,6 +1653,7 @@ fn phrase(
                 search_field.field(),
                 &OwnedValue::Str(token),
                 field_type,
+                &search_field.field_type(),
                 field.path().as_deref(),
                 false,
             )?;
@@ -1691,6 +1700,7 @@ fn phrase_array(
             search_field.field(),
             &OwnedValue::Str(tokens.pop().unwrap()),
             field_type,
+            &search_field.field_type(),
             field.path().as_deref(),
             false,
         )?;
@@ -1704,6 +1714,7 @@ fn phrase_array(
                 search_field.field(),
                 &OwnedValue::Str(token),
                 field_type,
+                &search_field.field_type(),
                 field.path().as_deref(),
                 false,
             )?;
@@ -1771,6 +1782,7 @@ fn parse_with_field<QueryParserCtor: Fn() -> QueryParser>(
                 search_field.field(),
                 &converted,
                 tantivy_field_type,
+                &search_field.field_type(),
                 field.path().as_deref(),
                 false,
             )?;
@@ -1855,6 +1867,7 @@ fn match_query(
             search_field.field(),
             &OwnedValue::Str(token),
             field_type,
+            &search_field.field_type(),
             field.path().as_deref(),
             false,
         )?);
@@ -1913,6 +1926,7 @@ fn match_array_query(
             search_field.field(),
             &OwnedValue::Str(token),
             field_type,
+            &search_field.field_type(),
             field.path().as_deref(),
             false,
         )?;
@@ -1959,6 +1973,7 @@ fn fuzzy_term(
         search_field.field(),
         &OwnedValue::Str(value),
         field_type,
+        &search_field.field_type(),
         field.path().as_deref(),
         false,
     )?;
