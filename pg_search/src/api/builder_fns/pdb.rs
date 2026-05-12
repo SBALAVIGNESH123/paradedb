@@ -430,6 +430,26 @@ mod pdb {
     }
 
     macro_rules! term_fn {
+        (func_name:ident, pgrx::datum::Timestamp | pgrx::datum::TimestampWithTimeZone) => {
+            #[builder_fn]
+            #[pg_extern(immutable, parallel_safe, name = "term")]
+            pub fn $func_name(value: $value_type) -> pdb::Query {
+                let tantivy_value = TantivyValue::try_from(value)
+                    .expect("value should be a valid TantivyValue representation")
+                    .tantivy_schema_value();
+                let is_datetime = match tantivy_value {
+                    OwnedValue::Date(_) => true,
+                    OwnedValue::I64(_) => true,
+                    _ => false,
+                };
+
+                pdb::Query::Term {
+                    value: tantivy_value,
+                    is_datetime,
+                }
+            }
+        };
+
         ($func_name:ident, $value_type:ty) => {
             #[builder_fn]
             #[pg_extern(immutable, parallel_safe, name = "term")]
@@ -453,10 +473,17 @@ mod pdb {
     #[builder_fn]
     #[pg_extern(immutable, parallel_safe, name = "term")]
     pub fn term_anyenum(value: AnyEnum) -> pdb::Query {
+        let value_is_i64_stored_time_type = matches!(
+            value.typeoid(),
+            pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID
+        );
         let tantivy_value = TantivyValue::try_from(value)
             .expect("value should be a valid TantivyValue representation")
             .tantivy_schema_value();
-        let is_datetime = matches!(tantivy_value, OwnedValue::Date(_));
+        let is_datetime = matches!(
+            (&tantivy_value, value_is_i64_stored_time_type),
+            (OwnedValue::Date(_), _) | (OwnedValue::I64(_), true)
+        );
 
         pdb::Query::Term {
             value: tantivy_value,
