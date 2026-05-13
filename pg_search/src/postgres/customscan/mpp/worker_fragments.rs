@@ -292,8 +292,8 @@ fn collect(
             );
         }
 
-        let task_count = stage.tasks.len();
-        if let Some(stage_plan) = stage.plan() {
+        let task_count = stage.task_count();
+        if let Some(stage_plan) = stage.local_plan() {
             for task_idx in 0..task_count {
                 let owner = proc_for_task(n_workers, task_idx as u32);
                 if owner == this_proc {

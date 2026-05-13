@@ -1528,7 +1528,28 @@ impl AggregateScan {
                         )),
                 );
 
-                let plan = Arc::clone(&fragment.plan);
+                // Wrap fragment.plan in a fresh `DistributedExec` and run
+                // `prepare_in_process_plan` to convert any nested boundaries'
+                // input stages from `Stage::Local` to `Stage::Remote`. Without
+                // this, a nested `NetworkShuffleExec` / `NetworkBroadcastExec`
+                // hitting `LocalStage::execute` errors when its task count
+                // exceeds 1; with the conversion, those boundaries dispatch
+                // through `ShmMqWorkerTransport` exactly like outer boundaries.
+                let plan = {
+                    let dist = Arc::new(datafusion_distributed::DistributedExec::new(Arc::clone(
+                        &fragment.plan,
+                    )));
+                    match dist.prepare_in_process_plan(&task_ctx) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return Err(datafusion::common::DataFusionError::Internal(format!(
+                                "mpp worker: prepare_in_process_plan failed for fragment \
+                                 (stage_id={}, task_idx={}): {e}",
+                                fragment.stage_id, fragment.task_idx
+                            )));
+                        }
+                    }
+                };
                 futures.push(Box::pin(run_worker_fragment(
                     plan,
                     per_partition_senders,

@@ -38,9 +38,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr_common::metrics::ExecutionPlanMetricsSet;
 use datafusion_distributed::{
-    OnMetadataCallback, Stage, WorkerConnection, WorkerPartitionStream, WorkerResolver,
-    WorkerTransport,
+    RemoteStage, WorkerConnection, WorkerPartitionStream, WorkerResolver, WorkerTransport,
 };
 use url::Url;
 
@@ -157,20 +157,21 @@ impl ShmMqWorkerTransport {
 impl WorkerTransport for ShmMqWorkerTransport {
     fn open(
         &self,
-        input_stage: &Stage,
+        input_stage: &RemoteStage,
         _target_partitions: Range<usize>,
         target_task: usize,
         _ctx: &Arc<TaskContext>,
-    ) -> Result<Box<dyn WorkerConnection>> {
+        _metrics: &ExecutionPlanMetricsSet,
+    ) -> Result<Box<dyn WorkerConnection + Send + Sync>> {
         let target_task_u32 = u32::try_from(target_task).map_err(|_| {
             DataFusionError::Internal(format!(
                 "ShmMqWorkerTransport: target_task={target_task} > u32::MAX"
             ))
         })?;
-        let stage_id = u32::try_from(input_stage.num()).map_err(|_| {
+        let stage_id = u32::try_from(input_stage.num).map_err(|_| {
             DataFusionError::Internal(format!(
-                "ShmMqWorkerTransport: input_stage.num()={} > u32::MAX",
-                input_stage.num()
+                "ShmMqWorkerTransport: input_stage.num={} > u32::MAX",
+                input_stage.num
             ))
         })?;
         let sender_proc = proc_for_task(self.mesh.n_workers(), target_task_u32);
@@ -204,11 +205,7 @@ struct ShmMqWorkerConnection {
 }
 
 impl WorkerConnection for ShmMqWorkerConnection {
-    fn stream_partition(
-        &self,
-        partition: usize,
-        _on_metadata: OnMetadataCallback,
-    ) -> Result<WorkerPartitionStream> {
+    fn stream_partition(&self, partition: usize) -> Result<WorkerPartitionStream> {
         let partition_u32 = u32::try_from(partition).map_err(|_| {
             DataFusionError::Internal(format!(
                 "ShmMqWorkerConnection: partition={partition} > u32::MAX"
