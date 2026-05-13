@@ -17,11 +17,11 @@
 
 //! MPP worker fragment runner.
 //!
-//! "Worker" matches the DF-D fork's terminology — every distributed task is
-//! a `WorkerConnection` on the receive side, and the fragment runner is
-//! that worker's push side.
+//! "Worker" matches the DF-D fork's terminology. Every distributed task
+//! is a `WorkerConnection` on the receive side, and the fragment runner
+//! is that worker's push side.
 //!
-//! - [`run_worker_fragment`] — PG-parallel-worker push loop. Runs the
+//! - [`run_worker_fragment`]: PG-parallel-worker push loop. Runs the
 //!   `n_partitions` output partitions of `plan` concurrently; each batch
 //!   yielded by partition `p` is encoded and pushed through
 //!   `outbound_senders[p]`. Returns when every output stream is exhausted.
@@ -86,18 +86,19 @@ pub async fn run_worker_fragment(
                 Ok(())
             }
             .await;
-            // Signal channel EOF so the consumer's per-(stage_id, partition)
-            // sub-buffer transitions to Eof. The shared shm_mq queue can't
-            // be relied on to detach — multiple fragments multiplex over
-            // the same queue, so dropping this partition's sender doesn't
-            // close the queue.
+            // Signal channel EOF so the consumer's per-(stage_id,
+            // partition) sub-buffer transitions to Eof. Don't rely on the
+            // shared shm_mq queue detaching: multiple fragments multiplex
+            // over the same queue, so dropping this partition's sender
+            // doesn't close it.
             //
-            // CORRECTNESS: send EOF even when the stream errored. Without
-            // this, a producer-side error (e.g. mid-scan I/O failure) leaves
-            // the consumer's M2.b sub-buffer stuck at `sources_done == 0`
-            // and the leader's `select_all` blocks forever. The deadlock
-            // detector only fires under `paradedb.mpp_debug = on`, so the
-            // production hang would be silent.
+            // CORRECTNESS: send EOF even when the stream errored. Skip it
+            // and a producer-side error (say a mid-scan I/O failure)
+            // leaves the consumer's sub-buffer stuck at
+            // `sources_done == 0`, and the leader's `select_all` blocks
+            // forever. The deadlock detector only fires under
+            // `paradedb.mpp_debug = on`, so the production hang would be
+            // silent.
             let eof_result = sender.as_ref().send_eof_traced(&mut stats).await;
             // Propagate the stream's error first; otherwise surface any EOF
             // send error so failure modes don't silently disappear.

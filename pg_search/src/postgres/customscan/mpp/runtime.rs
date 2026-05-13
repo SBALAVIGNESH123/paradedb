@@ -18,19 +18,21 @@
 //! Runtime glue between the leader's DataFusion execution and the
 //! shm_mq mesh.
 //!
-//! - [`MppMesh`] — runtime handle the leader builds at DSM-init time,
-//!   carrying one [`crate::postgres::customscan::mpp::transport::DrainHandle`]
-//!   per producer worker for each consumer partition. Installed on the
+//! - [`MppMesh`]: runtime handle the leader builds at DSM-init time. It
+//!   carries one
+//!   [`crate::postgres::customscan::mpp::transport::DrainHandle`] per
+//!   producer worker for each consumer partition. Installed on the
 //!   leader's `SessionConfig` extensions before plan execution.
-//! - [`ShmMqWorkerTransport`] — implements the DF-D fork's [`WorkerTransport`]
-//!   trait, consulted by `NetworkShuffleExec`/`NetworkCoalesceExec`/
-//!   `NetworkBroadcastExec` at execute time. `open(target_task=worker)`
-//!   returns a [`ShmMqWorkerConnection`] that yields one stream per
-//!   consumer partition from the corresponding [`DrainHandle`].
-//! - [`MppWorkerResolver`] — stub [`WorkerResolver`] returning N dummy
-//!   URLs. The DF-D fork's planner reads `get_urls().len()` to decide cluster
-//!   capacity; we don't have URLs (everything is in-process), so any
-//!   address satisfies the API.
+//! - [`ShmMqWorkerTransport`]: implements the DF-D fork's
+//!   [`WorkerTransport`] trait, consulted by
+//!   `NetworkShuffleExec`/`NetworkCoalesceExec`/`NetworkBroadcastExec` at
+//!   execute time. `open(target_task=worker)` returns a
+//!   [`ShmMqWorkerConnection`] that yields one stream per consumer
+//!   partition from the corresponding [`DrainHandle`].
+//! - [`MppWorkerResolver`]: stub [`WorkerResolver`] returning N dummy
+//!   URLs. The DF-D fork's planner reads `get_urls().len()` to decide
+//!   cluster capacity. We don't have URLs (everything is in-process), so
+//!   any address satisfies the API.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -48,9 +50,9 @@ use crate::postgres::customscan::mpp::transport::{CooperativeDrainSet, DrainHand
 
 /// `(producer_task_idx) → proc_idx` round-robin over the worker procs.
 ///
-/// Leader is `proc_idx = 0`; workers are `1..n_procs`. The mapping is a pure
-/// function of `task_idx % n_workers`, so it doesn't need a side table — every
-/// proc that knows `n_workers` computes the same answer.
+/// Leader is `proc_idx = 0`; workers are `1..n_procs`. The mapping is a
+/// pure function of `task_idx % n_workers`, so it doesn't need a side
+/// table: every proc that knows `n_workers` computes the same answer.
 ///
 /// With the planner's `target_partitions = n_workers` and
 /// `distributed_task_estimator = n_workers` knobs, the natural-shape plans
@@ -63,13 +65,12 @@ pub fn proc_for_task(n_workers: u32, task_idx: u32) -> u32 {
 
 /// Runtime handle the customscan populates at DSM-init time.
 ///
-/// M1.c restructured this from a `(worker, partition)`-indexed grid to a
-/// per-sender-proc map. Each shm_mq queue (one per `(sender_proc, this_proc)`
-/// pair in the V2 DSM grid) is multi-channel: frames from any number of
-/// `(stage_id, partition)` logical channels can arrive on one queue, tagged
-/// by [`MppFrameHeader`]. M2.b added the sub-buffer registry per
-/// [`DrainHandle`] so a single drain can fan frames out to multiple
-/// consumers keyed on `(stage_id, partition)`.
+/// Each shm_mq queue (one per `(sender_proc, this_proc)` pair in the V2
+/// DSM grid) is multi-channel. Frames from any number of `(stage_id,
+/// partition)` logical channels can arrive on one queue, tagged by
+/// [`MppFrameHeader`]. The sub-buffer registry on each [`DrainHandle`]
+/// fans them out to the matching consumers keyed on
+/// `(stage_id, partition)`.
 ///
 /// [`MppFrameHeader`]: crate::postgres::customscan::mpp::transport::MppFrameHeader
 pub struct MppMesh {
@@ -116,9 +117,10 @@ impl MppMesh {
 
     /// Pull from every installed inbound drain. Called from
     /// [`crate::postgres::customscan::mpp::transport::MppSender`]'s
-    /// cooperative-send spin so a producer stalled on a full outbound queue
-    /// can drain inbound peer data inline — preventing the N×N symmetric-send
-    /// deadlock when every peer is simultaneously stalled waiting for space.
+    /// cooperative-send spin so a producer stalled on a full outbound
+    /// queue can drain inbound peer data inline. That's what prevents
+    /// the N×N symmetric-send deadlock when every peer is simultaneously
+    /// stalled waiting for space.
     ///
     /// Returns the first error if any drain's `try_drain_pass` errors;
     /// otherwise `Ok(())` after all drains have been polled. Drains that
@@ -219,10 +221,10 @@ impl WorkerConnection for ShmMqWorkerConnection {
             ))
         })?;
         let drain = Arc::clone(drain);
-        // M2.b: ask the drain for the sub-buffer dedicated to this
-        // `(stage_id, partition)` channel. Frames the worker emits with a
-        // matching header land here; frames tagged with other partitions go
-        // to their own sub-buffers, so this consumer only sees its slice.
+        // Ask the drain for the sub-buffer dedicated to this
+        // `(stage_id, partition)` channel. Frames with a matching header
+        // land here; frames tagged with other partitions go to their own
+        // sub-buffers, so this consumer only sees its slice.
         let buffer = drain.register_channel(self.stage_id, partition_u32);
         crate::mpp_log!(
             "mpp transport::stream_partition this_proc={} sender_proc={} stage_id={} \

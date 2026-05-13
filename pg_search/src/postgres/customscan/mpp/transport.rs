@@ -18,22 +18,23 @@
 //! Transport layer for MPP shuffle.
 //!
 //! Layout:
-//! - [`MppFrameHeader`] is a fixed 16-byte prefix every wire message carries.
-//!   It tags the payload with `(stage_id, partition)` so a single underlying
-//!   queue can multiplex frames for many logical channels — the foundation
-//!   the multi-stage natural-shape path needs.
-//! - [`encode_frame_into`] / [`decode_frame`] serialize a `RecordBatch` with a
-//!   header prefix via Arrow IPC. [`encode_batch`] / [`decode_batch`] are
-//!   test-only header-less wrappers retained for codec round-trip tests.
-//! - [`DrainBuffer`] is the local per-participant queue that the drain thread
-//!   writes into and the DataFusion consumer reads from. It decouples
-//!   consumer-side backpressure from producer-side backpressure: the drain thread
-//!   always makes forward progress on the inbound shm_mqs, so a stalled consumer
-//!   cannot propagate backpressure to remote producers and cause an N×N
-//!   peer-stall cycle.
+//! - [`MppFrameHeader`] is a fixed 16-byte prefix every wire message
+//!   carries. It tags the payload with `(stage_id, partition)`, so one
+//!   underlying queue can carry frames for many logical channels at once.
+//!   That's what the multi-stage natural-shape path needs.
+//! - [`encode_frame_into`] / [`decode_frame`] serialize a `RecordBatch`
+//!   with a header prefix via Arrow IPC. [`encode_batch`] /
+//!   [`decode_batch`] are test-only header-less wrappers for codec
+//!   round-trip tests.
+//! - [`DrainBuffer`] is the local per-participant queue. The drain thread
+//!   writes into it; the DataFusion consumer reads from it. It decouples
+//!   consumer-side backpressure from producer-side backpressure. The
+//!   drain thread always makes forward progress on the inbound shm_mqs,
+//!   so a stalled consumer can't propagate backpressure to remote
+//!   producers and cause an N×N peer-stall cycle.
 //!
-//! The shm_mq-backed sender/receiver and drain thread spawn logic build on
-//! top of these primitives.
+//! The shm_mq-backed sender/receiver and drain-thread spawn logic build
+//! on top of these primitives.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -57,11 +58,11 @@ pub const MPP_FRAME_HEADER_SIZE: usize = 16;
 
 /// Kind of payload following [`MppFrameHeader`].
 ///
-/// `Batch` is the common case — header is followed by an Arrow IPC stream
-/// containing one `RecordBatch`. `Eof` carries no payload and signals the
-/// receiver that the named `(stage_id, partition)` channel is finished, even
-/// though the underlying shm_mq queue may still carry frames for other
-/// channels.
+/// `Batch` is the common case. The header is followed by an Arrow IPC
+/// stream containing one `RecordBatch`. `Eof` carries no payload. It
+/// signals the receiver that the named `(stage_id, partition)` channel
+/// is done, even though the underlying shm_mq queue may still carry
+/// frames for other channels.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MppFrameKind {
@@ -253,8 +254,9 @@ pub fn decode_batch(bytes: &[u8]) -> Result<RecordBatch, DataFusionError> {
 }
 
 /// Inverse of [`encode_frame_into`]. Parses the 16-byte header and, for
-/// `Batch` frames, decodes the trailing Arrow IPC stream. `Eof` frames return
-/// `(header, None)` — receivers branch on `header.kind()` to decide routing.
+/// `Batch` frames, decodes the trailing Arrow IPC stream. `Eof` frames
+/// return `(header, None)`. Receivers branch on `header.kind()` to decide
+/// routing.
 pub fn decode_frame(
     bytes: &[u8],
 ) -> Result<(MppFrameHeader, Option<RecordBatch>), DataFusionError> {
@@ -285,11 +287,11 @@ pub fn decode_frame(
 /// or the test-only thread variant) and the consumer that pops batches.
 ///
 /// In the cooperative path each `DrainBuffer` corresponds to one logical
-/// channel — i.e. one `(stage_id, partition)` entry in the owning
-/// [`DrainHandle`]'s registry. `num_sources` is always `1` there because a
-/// given drain serves a single sender_proc, which is the only producer for
-/// any channel routed through it. The test-only thread path uses a single
-/// shared buffer with `num_sources = N` over an N-sender setup.
+/// channel: one `(stage_id, partition)` entry in the owning
+/// [`DrainHandle`]'s registry. `num_sources` is always `1` there because
+/// a given drain serves a single sender_proc, which is the only producer
+/// for any channel routed through it. The test-only thread path uses a
+/// single shared buffer with `num_sources = N` over an N-sender setup.
 ///
 /// Push side: callers append deserialized batches; on source detach (or per-
 /// channel `Eof` frame) [`DrainBuffer::notify_source_done`] is called. Once
@@ -325,9 +327,9 @@ pub enum DrainItem {
 }
 
 impl DrainBuffer {
-    /// Create a drain buffer expecting `num_sources` inbound queues. For a
-    /// participant in an N-way mesh, `num_sources == N - 1` (all peers
-    /// excluding self — the self-partition bypasses the buffer).
+    /// Create a drain buffer expecting `num_sources` inbound queues. For
+    /// a participant in an N-way mesh, `num_sources == N - 1` (all peers
+    /// excluding self; the self-partition bypasses the buffer).
     pub fn new(num_sources: u32) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(DrainBufferInner {
@@ -443,21 +445,23 @@ pub trait BatchChannelReceiver: Send {
     fn try_recv(&self) -> RecvOutcome;
 }
 
-/// Byte channel sender paired with [`BatchChannelReceiver`]. `send` blocks when
-/// the channel is full. Dropping the sender signals EOF to the receiver.
+/// Byte channel sender paired with [`BatchChannelReceiver`]. `send`
+/// blocks when the channel is full. Dropping the sender signals EOF to
+/// the receiver.
 ///
-/// `Send` is required because unit tests and future producer-pump threads move
-/// senders across thread boundaries. Production shm_mq senders, however, must
-/// only be *used* from the main backend thread — the blocking shm_mq send path
-/// (`nowait=false`) touches `WaitLatch`/`CHECK_FOR_INTERRUPTS`, which is not
-/// safe off-thread. See [`crate::postgres::customscan::mpp::mesh::ShmMqSender`]
-/// for the safety contract.
+/// `Send` is required because unit tests and future producer-pump threads
+/// move senders across thread boundaries. Production shm_mq senders,
+/// though, must only be *used* from the main backend thread. The
+/// blocking shm_mq send path (`nowait=false`) touches
+/// `WaitLatch`/`CHECK_FOR_INTERRUPTS`, which isn't safe off-thread. See
+/// [`crate::postgres::customscan::mpp::mesh::ShmMqSender`] for the
+/// safety contract.
 pub trait BatchChannelSender: Send + Sync {
     fn send_bytes(&self, bytes: &[u8]) -> Result<(), DataFusionError>;
 
     /// Non-blocking variant. Returns `Ok(true)` on success, `Ok(false)`
-    /// when the channel is full (caller should retry), `Err` on detach /
-    /// transport error. Default falls back to the blocking send — safe
+    /// when the channel is full (caller should retry), `Err` on detach
+    /// or transport error. Default falls back to the blocking send. Safe
     /// for in-proc channels used by tests where "full" doesn't arise.
     fn try_send_bytes(&self, bytes: &[u8]) -> Result<bool, DataFusionError> {
         self.send_bytes(bytes).map(|()| true)
@@ -489,11 +493,12 @@ impl CooperativeDrainSet for DrainHandle {
 /// our drain pulls peer-shipped rows out of our inbound queues, which
 /// frees peers' outbound-to-us send space, which lets their sends un-stall.
 pub struct MppSender {
-    /// Underlying byte channel. Held behind `Arc` so multiple `MppSender`s
-    /// can share one `shm_mq` queue while tagging frames with different
-    /// `(stage_id, partition)` headers — the multiplexed path's natural
-    /// pattern. Clone the Arc, build a new `MppSender` with a different
-    /// header, both write into the same queue.
+    /// Underlying byte channel. Held behind `Arc` so multiple
+    /// `MppSender`s can share one `shm_mq` queue while tagging frames
+    /// with different `(stage_id, partition)` headers, which is the
+    /// multiplexed path's natural pattern. Clone the Arc, build a new
+    /// `MppSender` with a different header, both write into the same
+    /// queue.
     channel: Arc<dyn BatchChannelSender>,
     cooperative_drain: Option<Arc<dyn CooperativeDrainSet>>,
     /// Frame header prepended to every outgoing batch. Identifies the logical
@@ -528,10 +533,10 @@ unsafe impl Sync for MppSender {}
 
 impl MppSender {
     /// Construct a sender that tags every outgoing batch with `header`.
-    /// Production call sites clone one shared `Arc<dyn BatchChannelSender>`
-    /// across N senders, each with a different `MppFrameHeader::batch(stage, p)`
-    /// — the multiplexed pattern for fanning multiple partitions over one
-    /// shm_mq queue.
+    /// Production call sites clone one shared `Arc<dyn
+    /// BatchChannelSender>` across N senders, each with a different
+    /// `MppFrameHeader::batch(stage, p)`. That's the multiplexed pattern
+    /// for fanning multiple partitions over one shm_mq queue.
     pub fn with_header(channel: Arc<dyn BatchChannelSender>, header: MppFrameHeader) -> Self {
         Self {
             channel,
@@ -601,7 +606,7 @@ impl MppSender {
     /// outbound queue is full.
     ///
     /// Async because the cooperative-spin path needs to surrender the
-    /// Tokio runtime back periodically — see the body comment.
+    /// Tokio runtime back periodically. See the body comment.
     pub async fn send_batch_traced(
         &self,
         batch: &RecordBatch,
@@ -610,13 +615,13 @@ impl MppSender {
         // Take the scratch buffer out of the `RefCell` rather than
         // holding a `RefMut` across the spin below. The spin contains
         // `pgrx::check_for_interrupts!()`, which can `longjmp` through
-        // Rust frames; a `longjmp` does not run `Drop`, so a `RefMut`
-        // held across it would leave the cell perpetually borrowed and
-        // panic the next caller. `replace` is atomic — the cell is
-        // never observed in a borrowed state — and we put the buffer
-        // back at the end so its heap allocation survives across calls.
-        // If the spin longjmps anyway, the cell holds the default empty
-        // `Vec` and the next call simply re-allocates.
+        // Rust frames. A `longjmp` doesn't run `Drop`, so a `RefMut` held
+        // across it would leave the cell perpetually borrowed and panic
+        // the next caller. `replace` is atomic (the cell is never
+        // observed in a borrowed state), and we put the buffer back at
+        // the end so its heap allocation survives across calls. If the
+        // spin longjmps anyway, the cell holds the default empty `Vec`
+        // and the next call just re-allocates.
         let mut scratch = self.scratch.replace(Vec::new());
         let result = self.send_with_scratch(batch, &mut scratch, stats).await;
         self.scratch.replace(scratch);
@@ -643,11 +648,11 @@ impl MppSender {
     /// Symmetric-EOF safety: when every peer reaches EOF simultaneously
     /// with full outbound queues, each peer's cooperative
     /// [`CooperativeDrainSet::try_drain_pass`] inside the spin pulls
-    /// peer-sent frames out of its own inbound queues, freeing space
-    /// the peers are blocked on. Progress is monotone — at least one
+    /// peer-sent frames out of its own inbound queues, freeing space the
+    /// peers are blocked on. Progress is monotone: at least one
     /// `try_send_bytes` succeeds per spin iteration somewhere in the
-    /// mesh, so symmetric stalls resolve within a few iterations
-    /// rather than deadlocking.
+    /// mesh, so symmetric stalls resolve within a few iterations rather
+    /// than deadlocking.
     pub async fn send_eof_traced(&self, stats: &mut SendBatchStats) -> Result<(), DataFusionError> {
         let mut scratch = self.scratch.replace(Vec::new());
         let result = self.send_eof_with_scratch(&mut scratch, stats).await;
@@ -701,15 +706,15 @@ impl MppSender {
         let mut first_try = true;
         let t_wait_start = Instant::now();
         // Mental model: a current-thread Tokio runtime lives on the
-        // backend thread (DataFusion needs one to drive `Stream`s).
-        // This spin runs *inside* a Tokio task — specifically the body
-        // of `ShuffleStream::poll_next`. The deadlock the cooperative
-        // drain prevents is *cross-participant*, not same-runtime: two
-        // peers each blocking on a full outbound and never reading the
-        // other side. We break that by driving our own inbound on this
-        // same OS thread via `try_drain_pass`, which pulls peer
-        // batches that have already arrived and frees their slots so
-        // peers' writers can advance.
+        // backend thread (DataFusion needs one to drive `Stream`s). This
+        // spin runs *inside* a Tokio task, specifically the body of
+        // `ShuffleStream::poll_next`. The deadlock the cooperative drain
+        // prevents is *cross-participant*, not same-runtime: two peers
+        // each blocking on a full outbound and never reading the other
+        // side. We break that by driving our own inbound on this same
+        // OS thread via `try_drain_pass`, which pulls peer batches that
+        // have already arrived and frees their slots so peers' writers
+        // can advance.
         //
         // The `tokio::task::yield_now().await` between iterations
         // hands the runtime back to the executor each spin. Today's
@@ -740,8 +745,8 @@ impl MppSender {
             first_try = false;
             stats.spin_iters += 1;
             // Would-block: pull from our own mesh's inbound so peers'
-            // sends to us unblock. Without this interleave two
-            // participants blocking on symmetric sends deadlock —
+            // sends to us unblock. Without this interleave, two
+            // participants blocking on symmetric sends deadlock and
             // neither gets to drain. Errors propagate so a peer
             // detaching mid-spin doesn't leave the sender looping
             // forever on a closed mesh.
@@ -795,25 +800,23 @@ impl MppReceiver {
     }
 }
 
-/// Decoded result of an [`MppReceiver::try_recv_batch`]. Carries the parsed
-/// [`MppFrameHeader`] so the drain thread can route the payload to the right
-/// `(stage_id, partition)` sub-buffer once multi-stage multiplexing lands.
-/// Today's positional design ignores `header` because there is exactly one
-/// channel per queue; M1.c starts consuming the field for routing.
+/// Decoded result of an [`MppReceiver::try_recv_batch`]. Carries the
+/// parsed [`MppFrameHeader`] so the drain thread can route the payload to
+/// the right `(stage_id, partition)` sub-buffer.
 #[derive(Debug)]
 pub enum RecvBatchOutcome {
     Batch {
-        // Consumed by M1.c's per-(stage_id, partition) demux.
+        // Consumed by the per-(stage_id, partition) demux.
         #[allow(dead_code)]
         header: MppFrameHeader,
         batch: RecordBatch,
     },
     /// A payload-less `Eof` frame for `header.(stage_id, partition)`. The
-    /// underlying shm_mq queue is still attached; the sender is announcing
-    /// that this logical channel is done. Used by the multiplexed design to
-    /// per-channel-EOF without dropping the whole queue.
+    /// underlying shm_mq queue is still attached. The sender is just
+    /// signalling that this logical channel is done, so we can EOF
+    /// per-channel without dropping the whole queue.
     Eof {
-        // Consumed by M1.c's per-(stage_id, partition) demux.
+        // Consumed by the per-(stage_id, partition) demux.
         #[allow(dead_code)]
         header: MppFrameHeader,
     },
@@ -824,10 +827,10 @@ pub enum RecvBatchOutcome {
 
 /// Configuration for [`spawn_drain_thread`].
 ///
-/// Only used by the thread-backed drain path, which is test-only: pgrx panics
-/// on any pg FFI call (including `shm_mq_receive`) from a non-backend thread,
-/// so production uses [`DrainHandle::cooperative`] — see the notes on
-/// `DrainHandle::spawn` for details.
+/// Only used by the thread-backed drain path, which is test-only. pgrx
+/// panics on any pg FFI call (including `shm_mq_receive`) from a
+/// non-backend thread, so production uses [`DrainHandle::cooperative`].
+/// See the notes on `DrainHandle::spawn` for details.
 #[cfg(test)]
 pub struct DrainConfig {
     /// Receivers to drain. Ownership moves into the spawned thread.
@@ -862,20 +865,21 @@ pub fn spawn_drain_thread(config: DrainConfig) -> JoinHandle<Result<(), DataFusi
     thread::spawn(move || drain_loop(config))
 }
 
-/// Per-`(stage_id, partition)` sub-buffer registry owned by a cooperative
-/// [`DrainHandle`]. The handle serves one sender_proc — that proc's shm_mq
-/// queue carries frames for many logical channels, each tagged by the
-/// [`MppFrameHeader`] prefix. `try_drain_pass` looks up the right sub-buffer
-/// on every frame and pushes the payload into it, so consumers waiting on
-/// `(stage_id=s, partition=p)` see only frames matching that key.
+/// Per-`(stage_id, partition)` sub-buffer registry owned by a
+/// cooperative [`DrainHandle`]. The handle serves one sender_proc, whose
+/// shm_mq queue carries frames for many logical channels, each tagged by
+/// the [`MppFrameHeader`] prefix. `try_drain_pass` looks up the right
+/// sub-buffer on every frame and pushes the payload into it. Consumers
+/// waiting on `(stage_id=s, partition=p)` only see frames matching that
+/// key.
 ///
 /// Each entry is a `DrainBuffer::new(1)` because exactly one source (the
-/// sender_proc this handle serves) emits frames for any given channel via
-/// this drain. When the sender_proc detaches (`Detached` outcome on the
-/// underlying receiver) `detached` flips to `true` and every existing
-/// sub-buffer is notified — any consumer blocked on `try_pop` unblocks with
-/// `DrainItem::Eof`. Sub-buffers registered *after* detach come back
-/// already EOF'd so a late consumer doesn't hang.
+/// sender_proc this handle serves) emits frames for any given channel
+/// via this drain. When the sender_proc detaches (`Detached` outcome on
+/// the underlying receiver), `detached` flips to `true` and every
+/// existing sub-buffer is notified, so any consumer blocked on `try_pop`
+/// unblocks with `DrainItem::Eof`. Sub-buffers registered *after* detach
+/// come back already EOF'd so a late consumer doesn't hang.
 #[derive(Default)]
 struct SubBufferRegistry {
     map: HashMap<(u32, u32), Arc<DrainBuffer>>,
@@ -886,15 +890,15 @@ struct SubBufferRegistry {
 /// per-`(stage_id, partition)` sub-buffer registry.
 ///
 /// On drop, the handle cancels every sub-buffer (unblocking any waiting
-/// consumer) and joins the test-only thread if one is attached. This
-/// guarantees the drain thread never outlives the query's DSM segment — if
-/// `ExecEndCustomScan` panics after dropping the handle, the thread has
-/// already been torn down and cannot touch the freed shm_mq memory.
+/// consumer) and joins the test-only thread if one is attached. That
+/// guarantees the drain thread never outlives the query's DSM segment:
+/// if `ExecEndCustomScan` panics after dropping the handle, the thread
+/// has already been torn down and can't touch the freed shm_mq memory.
 ///
-/// Review finding: the prior implementation's `JoinHandle` was hanging off
-/// free-form execution state, so an error path that skipped manual cleanup
-/// left a zombie drain thread alive with dangling DSM pointers. Enforcing
-/// cancel+join via Drop closes that window.
+/// Review finding: the prior implementation's `JoinHandle` hung off
+/// free-form execution state, so any error path that skipped manual
+/// cleanup left a zombie drain thread alive with dangling DSM pointers.
+/// Enforcing cancel+join via Drop closes that window.
 pub struct DrainHandle {
     /// Cooperative variant's per-(stage_id, partition) sub-buffer registry.
     /// Populated lazily on first frame for a channel, or up-front by callers
@@ -906,11 +910,12 @@ pub struct DrainHandle {
     /// the same buffer they constructed in `DrainConfig`. The cooperative
     /// path keeps this `None` and routes everything through `sub_buffers`.
     legacy_buffer: Option<Arc<DrainBuffer>>,
-    /// Background-thread variant: `Some(JoinHandle)`. In-proc tests still use
-    /// this path — their `InProcReceiver` is an `std::sync::mpsc` wrapper, not
-    /// a pg FFI call, so the drain thread is safe. Wrapped in `Mutex` so
-    /// `shutdown(&self)` can take the handle without needing `&mut self` —
-    /// this lets cooperative senders hold `Arc<DrainHandle>` shares.
+    /// Background-thread variant: `Some(JoinHandle)`. In-proc tests
+    /// still use this path. Their `InProcReceiver` is an
+    /// `std::sync::mpsc` wrapper, not a pg FFI call, so the drain thread
+    /// is safe. Wrapped in `Mutex` so `shutdown(&self)` can take the
+    /// handle without needing `&mut self`; cooperative senders hold
+    /// `Arc<DrainHandle>` shares.
     join: Mutex<Option<JoinHandle<Result<(), DataFusionError>>>>,
     /// Cooperative variant: the receivers are owned by the handle and polled
     /// inline from `DrainGatherStream::poll_next` via [`Self::try_drain_pass`].
@@ -919,9 +924,9 @@ pub struct DrainHandle {
     /// `check_active_thread` guard. `None` when the handle was spawned
     /// instead of constructed cooperatively.
     ///
-    /// `Send` bound on `MppReceiver` is preserved — the receivers move
-    /// thread-once at construction then are only accessed from the backend
-    /// thread; the `Mutex` is just for interior mutability, not
+    /// `Send` bound on `MppReceiver` is preserved. The receivers move
+    /// thread-once at construction, then are only accessed from the
+    /// backend thread. The `Mutex` is just for interior mutability, not
     /// cross-thread coordination.
     coop_receivers: Mutex<Option<Vec<Option<MppReceiver>>>>,
 }
@@ -944,11 +949,12 @@ impl DrainHandle {
         }
     }
 
-    /// Construct a cooperative drain handle: the receivers are stashed in the
-    /// handle and drained inline from `DrainGatherStream::poll_next` (see
-    /// [`Self::try_drain_pass`]). No background thread. This is the correct
-    /// variant for production pg backend workers — the drain work runs on
-    /// the backend thread, so any pg FFI inside `shm_mq_receive` is safe.
+    /// Construct a cooperative drain handle. The receivers are stashed
+    /// in the handle and drained inline from
+    /// `DrainGatherStream::poll_next` (see [`Self::try_drain_pass`]). No
+    /// background thread. This is the correct variant for production pg
+    /// backend workers, because the drain work runs on the backend
+    /// thread, so any pg FFI inside `shm_mq_receive` is safe.
     ///
     /// Sub-buffers are populated lazily by `try_drain_pass` when a frame
     /// arrives, or up-front by [`Self::register_channel`] when a consumer
@@ -998,11 +1004,12 @@ impl DrainHandle {
     /// unblocks with `Eof` even if the query is torn down before EOF frames
     /// flow.
     ///
-    /// Collects buffer handles under the registry lock, then notifies after
-    /// releasing it. Notifying inline would block any concurrent
+    /// Collects buffer handles under the registry lock, then notifies
+    /// after releasing it. Notifying inline would block any concurrent
     /// [`Self::register_channel`] for as long as it takes to acquire
-    /// `DrainBuffer::inner` N times — fine today (single backend thread),
-    /// but cheap insurance against the multi-thread variant landing later.
+    /// `DrainBuffer::inner` N times. Fine today (single backend thread),
+    /// but cheap insurance against the multi-thread variant landing
+    /// later.
     fn mark_detached(&self) {
         let to_notify = {
             let mut guard = self
@@ -1039,16 +1046,16 @@ impl DrainHandle {
     /// Pull batches from each live receiver and demux them into the
     /// per-`(stage_id, partition)` sub-buffer registry. Called from
     /// `DrainGatherStream::poll_next` and from `MppSender::send_batch`'s
-    /// cooperative spin — drain work happens on the backend thread
+    /// cooperative spin. Drain work happens on the backend thread
     /// (pgrx-safe). No-op for thread-backed handles.
     ///
-    /// Each pass drains *every available* batch from each receiver (up to
-    /// a safety cap). Pulling only one batch per source per call means
-    /// that under steady producer pressure the cooperative sender's
-    /// spin-loop cannot keep up — we'd fall N:1 behind peers' sends and
-    /// the mesh stalls once any queue fills. Draining until the receiver
-    /// reports `Empty` bounds each pass by queue depth rather than by
-    /// spin-loop iteration count.
+    /// Each pass drains *every available* batch from each receiver (up
+    /// to a safety cap). Pulling only one batch per source per call
+    /// means that under steady producer pressure the cooperative
+    /// sender's spin-loop can't keep up: we'd fall N:1 behind peers'
+    /// sends and the mesh would stall once any queue fills. Draining
+    /// until the receiver reports `Empty` bounds each pass by queue
+    /// depth rather than by spin-loop iteration count.
     ///
     /// Returns `Ok(())` once every cooperative receiver has been pulled until
     /// `Empty` (or detached). A previous version returned a `bool` indicating
@@ -1067,15 +1074,15 @@ impl DrainHandle {
     /// - `Detached` / `Error`: queue-wide shutdown. Notify every registered
     ///   sub-buffer, mark the handle detached, and drop the slot.
     pub fn try_drain_pass(&self) -> Result<(), DataFusionError> {
-        // Bound per-source pulls per call. The upper limit exists to give
-        // the caller a chance to re-try its own send between drains —
-        // otherwise a participant with a very fast peer could drain
-        // indefinitely on one source and starve its own outbound.
+        // Bound per-source pulls per call. The upper limit exists to
+        // give the caller a chance to re-try its own send between
+        // drains. Without it, a participant with a very fast peer could
+        // drain indefinitely on one source and starve its own outbound.
         const MAX_BATCHES_PER_SOURCE_PER_PASS: usize = 256;
 
         let mut guard = self.coop_receivers.lock().unwrap();
         let Some(slots) = guard.as_mut() else {
-            // Thread-backed handle — caller should read from buffer directly.
+            // Thread-backed handle. Caller should read from buffer directly.
             return Ok(());
         };
         for slot in slots.iter_mut() {
@@ -1145,11 +1152,12 @@ impl Drop for DrainHandle {
     }
 }
 
-/// Test-only thread-backed drain. Writes every observed frame into a single
-/// shared [`DrainBuffer`] — the *legacy* `num_sources = N` model the cooperative
-/// path replaced. Per-channel `Eof` frames are treated as "this source is
-/// done" (not "this logical channel within the source is done"), matching the
-/// original single-buffer semantics. Production code routes through
+/// Test-only thread-backed drain. Writes every observed frame into a
+/// single shared [`DrainBuffer`]. This is the *legacy* `num_sources = N`
+/// model the cooperative path replaced. Per-channel `Eof` frames are
+/// treated as "this source is done" (not "this logical channel within
+/// the source is done"), matching the original single-buffer semantics.
+/// Production code routes through
 /// [`DrainHandle::try_drain_pass`] instead, which keys on the frame header.
 /// Tests that want to validate the production demux must use
 /// [`DrainHandle::cooperative`] and call `try_drain_pass` directly.
@@ -1214,20 +1222,21 @@ fn drain_loop(config: DrainConfig) -> Result<(), DataFusionError> {
 
 /// SPSC channel pair for two use cases:
 /// - Unit tests (bounded capacity, exercising backpressure).
-/// - Production self-loop slots: when a worker's fragment emits a partition
-///   destined for its OWN proc (e.g. peer-mesh hash routing where consumer
-///   task t lands on the same worker as producer task t), the shm_mq grid
-///   leaves the `slot(this_proc, this_proc)` diagonal unattached. M2.d's
-///   dispatcher routes those self-loops through this in-proc channel
-///   instead, sharing the same `BatchChannelSender`/`BatchChannelReceiver`
-///   abstraction as shm_mq so the drain / sub-buffer registry needs no
-///   special-case for them.
+/// - Production self-loop slots: when a worker's fragment emits a
+///   partition destined for its OWN proc (e.g. peer-mesh hash routing
+///   where consumer task t lands on the same worker as producer task t),
+///   the shm_mq grid leaves the `slot(this_proc, this_proc)` diagonal
+///   unattached. The dispatcher routes those self-loops through this
+///   in-proc channel instead. It shares the same
+///   `BatchChannelSender`/`BatchChannelReceiver` abstraction as shm_mq,
+///   so the drain and sub-buffer registry don't need a special case.
 ///
-/// Production callers pass a very large `capacity` (so the channel is
-/// effectively unbounded under steady state) — the current-thread Tokio
+/// Production callers pass a very large `capacity` so the channel is
+/// effectively unbounded under steady state. The current-thread Tokio
 /// runtime interleaves producer and consumer fragments via
-/// `yield_now().await`, so backpressure would be benign, but unbounded
-/// avoids any chance of a self-deadlock if the producer never yields.
+/// `yield_now().await`, so backpressure would be benign anyway, but
+/// unbounded rules out any chance of self-deadlock if the producer never
+/// yields.
 pub fn in_proc_channel(capacity: usize) -> (InProcSender, InProcReceiver) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(capacity);
     (InProcSender { tx }, InProcReceiver { rx: Mutex::new(rx) })
@@ -1622,10 +1631,11 @@ mod tests {
     // They help us bound the transport layer's cost independently of
     // DataFusion/Tantivy. All use the `in_proc_channel` backend (same
     // `MppSender`/`MppReceiver` trait boundary as the shm_mq one), so
-    // numbers here are an optimistic ceiling — shm_mq adds the ring-buffer
-    // copy + cross-process notification cost on top. If these numbers are
-    // already below the row rate the real query needs, we know IPC encode
-    // + channel handoff is the bottleneck without needing CI data.
+    // numbers here are an optimistic ceiling. shm_mq adds the
+    // ring-buffer copy + cross-process notification cost on top. If
+    // these numbers are already below the row rate the real query
+    // needs, we know IPC encode + channel handoff is the bottleneck
+    // without needing CI data.
     // ---------------------------------------------------------------------
 
     /// Row shape matching the post-Partial shuffle in
@@ -1637,7 +1647,7 @@ mod tests {
             Field::new("count_partial", DataType::UInt64, false),
             Field::new("sum_partial", DataType::Int64, false),
         ]));
-        // Titles averaging ~30 bytes — typical for the docs dataset.
+        // Titles averaging ~30 bytes, typical for the docs dataset.
         let titles = StringArray::from_iter_values(
             (0..rows).map(|i| format!("file_{i:012}_title_with_some_length")),
         );
@@ -1758,14 +1768,15 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // M2.b — per-`(stage_id, partition)` sub-buffer registry on the
-    // cooperative `DrainHandle`.
+    // Per-`(stage_id, partition)` sub-buffer registry on the cooperative
+    // `DrainHandle`.
     //
-    // Producers stamp `MppFrameHeader::batch(stage_id, partition)` on every
-    // outgoing frame; the receiver-side cooperative drain demuxes by header
-    // into a sub-buffer per `(stage_id, partition)`. These tests use the
-    // `in_proc_channel` backend to drive `try_drain_pass` from the test
-    // thread, mirroring how the production path runs the drain inline from
+    // Producers stamp `MppFrameHeader::batch(stage_id, partition)` on
+    // every outgoing frame, and the receiver-side cooperative drain
+    // demuxes by header into a sub-buffer per `(stage_id, partition)`.
+    // These tests use the `in_proc_channel` backend to drive
+    // `try_drain_pass` from the test thread. That mirrors how the
+    // production path runs the drain inline from
     // `DrainGatherStream::poll_next` on the backend thread.
     // ---------------------------------------------------------------------
 
@@ -1785,7 +1796,7 @@ mod tests {
 
     #[test]
     fn drain_handle_demuxes_frames_by_header() {
-        // One queue carrying two channels — `(0, 0)` and `(0, 1)`. Each
+        // One queue carrying two channels: `(0, 0)` and `(0, 1)`. Each
         // sub-buffer receives only its own batches.
         let (tx, rx) = in_proc_channel(8);
         let base = MppSender::new(Arc::new(tx));
@@ -1799,7 +1810,7 @@ mod tests {
         s00.send_batch(&sample_batch(3)).unwrap();
         drop(s00);
         drop(s01);
-        drop(base); // last sender dropped — receiver will report Detached.
+        drop(base); // Last sender dropped. Receiver will report Detached.
 
         let buf00 = handle.register_channel(0, 0);
         let buf01 = handle.register_channel(0, 1);
@@ -1867,8 +1878,9 @@ mod tests {
     fn drain_handle_detach_eofs_all_registered_sub_buffers() {
         // No frames flow; consumer pre-registers two channels. When the
         // sender drops and `try_drain_pass` observes `Detached`, both
-        // sub-buffers immediately surface `Eof` — without this, a consumer
-        // blocked on `try_pop` would hang past the producer's death.
+        // sub-buffers immediately surface `Eof`. Without that, a
+        // consumer blocked on `try_pop` would hang past the producer's
+        // death.
         let (tx, rx) = in_proc_channel(8);
         drop(tx); // detach immediately
         let receiver = MppReceiver::new(Box::new(rx));
@@ -1949,10 +1961,10 @@ mod tests {
 
     #[test]
     fn drain_handle_drop_cancels_registered_sub_buffers() {
-        // Dropping a cooperative DrainHandle must wake any consumer holding
-        // an Arc<DrainBuffer> from `register_channel` — otherwise a query
-        // error path that tears down the mesh would leave a consumer
-        // blocked on a buffer that will never see EOF.
+        // Dropping a cooperative DrainHandle must wake any consumer
+        // holding an Arc<DrainBuffer> from `register_channel`. Otherwise
+        // a query error path that tears down the mesh would leave a
+        // consumer blocked on a buffer that will never see EOF.
         let (_tx, rx) = in_proc_channel(8);
         let receiver = MppReceiver::new(Box::new(rx));
         let handle = DrainHandle::cooperative(vec![receiver]);

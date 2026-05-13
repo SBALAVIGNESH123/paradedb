@@ -22,12 +22,12 @@
 //! (DSM math, shm_mq FFI, DF-D fork's `WorkerTransport` plumbing) is hidden
 //! behind the API:
 //!
-//! - [`mpp_is_active`] — gate for the customscan path-builder.
-//! - [`estimate_dsm_size`] — `estimate_dsm_custom_scan` body.
-//! - [`leader_setup`] — `initialize_dsm_custom_scan` body. Returns the
+//! - [`mpp_is_active`]: gate for the customscan path-builder.
+//! - [`estimate_dsm_size`]: `estimate_dsm_custom_scan` body.
+//! - [`leader_setup`]: `initialize_dsm_custom_scan` body. Returns the
 //!   leader's [`MppLeaderState`] which carries the runtime [`MppMesh`]
 //!   handle the customscan installs on its DataFusion `SessionContext`.
-//! - [`worker_setup`] — `initialize_worker_custom_scan` body. Returns the
+//! - [`worker_setup`]: `initialize_worker_custom_scan` body. Returns the
 //!   worker's [`MppWorkerState`] which carries the worker's outbound
 //!   senders and the deserialized plan bytes the worker runs.
 
@@ -114,10 +114,10 @@ pub fn n_procs() -> u32 {
 /// Returned to the leader from [`leader_setup`]. The customscan stashes this
 /// on its execution state and consults it during `exec_custom_scan`.
 ///
-/// The leader is consumer-only in this iteration, so its outbound senders
-/// (worker-0 producer slot) and `MppParticipantConfig` are not held here —
-/// they are dropped inside `leader_setup` and will be re-introduced when
-/// leader-as-worker-0 is wired up.
+/// The leader is consumer-only in this iteration, so its outbound
+/// senders (worker-0 producer slot) and `MppParticipantConfig` aren't
+/// held here. They're dropped inside `leader_setup` and will be
+/// re-introduced when leader-as-worker-0 is wired up.
 pub struct MppLeaderState {
     /// Runtime mesh handle. Install on the leader's `SessionContext` via
     /// `with_extension(Arc::clone(&mesh))` so `ShmMqWorkerTransport` can find
@@ -155,19 +155,20 @@ pub unsafe fn leader_setup(
 
     let attach = unsafe { leader_init(coordinate, seg, &layout, &plan_bytes) }?;
 
-    // M1.c: build the proc-pair indexed mesh. The leader is `proc_idx = 0`;
-    // its inbound queues are `slot(*, 0)` for every peer (workers 1..n_procs).
-    // `attach.inbound_receivers` is already peer-indexed (self-loop skipped),
-    // so receiver[i] corresponds to peer_proc_for_index(0, i) = i + 1.
+    // Build the proc-pair indexed mesh. The leader is `proc_idx = 0`; its
+    // inbound queues are `slot(*, 0)` for every peer (workers 1..n_procs).
+    // `attach.inbound_receivers` is peer-indexed with the self-loop
+    // skipped, so receiver[i] corresponds to peer_proc_for_index(0, i) =
+    // i + 1.
     //
-    // The mesh stores `inbound_drains[sender_proc]` so `runtime.rs` can look
-    // up the right drain in O(1) given a sender_proc from the natural-shape
-    // gather; the self-loop entry at index 0 is `None`.
+    // The mesh stores `inbound_drains[sender_proc]` so `runtime.rs` can
+    // look up the right drain in O(1) given a sender_proc. The self-loop
+    // entry at index 0 is `None`.
     //
-    // M2.b: each `DrainHandle` owns a per-`(stage_id, partition)` sub-buffer
-    // registry, so one shm_mq queue can multiplex frames from many logical
-    // channels — the sub-buffer is created lazily on first frame OR by
-    // `WorkerConnection::stream_partition` registering ahead of time.
+    // Each `DrainHandle` owns a per-`(stage_id, partition)` sub-buffer
+    // registry, so one shm_mq queue can carry frames from many logical
+    // channels. Sub-buffers are created lazily on first frame, or
+    // up-front by `WorkerConnection::stream_partition`.
     let _ = n_partitions;
     let mut inbound_drains: Vec<Option<Arc<DrainHandle>>> =
         Vec::with_capacity(total_procs as usize);
@@ -185,8 +186,8 @@ pub unsafe fn leader_setup(
 
     let mesh = Arc::new(MppMesh::new(0, total_procs, inbound_drains));
 
-    // Drop the leader's own outbound senders — the leader doesn't yet host
-    // a producer fragment in single-stage mode.
+    // Drop the leader's own outbound senders. The leader doesn't yet
+    // host a producer fragment in single-stage mode.
     drop(attach.outbound_senders);
 
     Ok(MppLeaderState { mesh, pcxt })
@@ -210,11 +211,12 @@ pub struct MppWorkerState {
     /// the `PgSearchExtensionCodec` to get an `Arc<dyn ExecutionPlan>`.
     pub plan_bytes: Vec<u8>,
     pub participant_config: MppParticipantConfig,
-    /// Worker's MppMesh — same shape as the leader's. `inbound_drains[sender_proc]`
-    /// pulls frames from `slot(sender_proc, this_proc)`. Workers consume from
-    /// peers when running consumer fragments (e.g. a `FinalPartitioned`
-    /// aggregate above a `NetworkShuffleExec` peer-mesh). Read by
-    /// M2.d.3's multi-fragment dispatcher in `aggregatescan::exec_mpp_worker`.
+    /// Worker's MppMesh, same shape as the leader's.
+    /// `inbound_drains[sender_proc]` pulls frames from
+    /// `slot(sender_proc, this_proc)`. Workers consume from peers when
+    /// running consumer fragments (e.g. a `FinalPartitioned` aggregate
+    /// above a `NetworkShuffleExec` peer-mesh). Read by the multi-fragment
+    /// dispatcher in `aggregatescan::exec_mpp_worker`.
     #[allow(dead_code)]
     pub mesh: Arc<MppMesh>,
 }
@@ -236,20 +238,20 @@ pub unsafe fn worker_setup(
     if worker_number < 0 {
         return Err("mpp: worker_number < 0".into());
     }
-    // M1.b: leader is now `proc_idx = 0`, workers are `1..n_procs`. Worker N
-    // maps from PG's `ParallelWorkerNumber = N` to `proc_idx = N + 1`.
+    // Leader is `proc_idx = 0`, workers are `1..n_procs`. Worker N maps
+    // from PG's `ParallelWorkerNumber = N` to `proc_idx = N + 1`.
     let proc_idx = (worker_number as u32) + 1;
 
     let (header, plan_bytes, attach) =
         unsafe { worker_attach(coordinate, region_total, proc_idx, seg) }?;
     let total_procs = header.n_procs;
 
-    // M2.d: build per-proc-indexed outbound senders. Each MppSender wraps the
+    // Build per-proc-indexed outbound senders. Each MppSender wraps the
     // queue's `Arc<dyn BatchChannelSender>` so per-(stage_id, partition)
     // clones can multiplex over the same shm_mq slot. The slot at
-    // proc_idx==this_proc is `None` because self-loops are never attached
-    // (`compute_dsm_layout` reserves the bytes but `worker_attach` skips
-    // them).
+    // proc_idx==this_proc is `None`; self-loops are never attached.
+    // `compute_dsm_layout` reserves the bytes but `worker_attach` skips
+    // them.
     let mut outbound_senders: Vec<Option<MppSender>> = (0..total_procs).map(|_| None).collect();
     for (peer_idx, shm_send) in attach.outbound_senders.into_iter().enumerate() {
         let target_proc = peer_proc_for_index(proc_idx, peer_idx as u32);
@@ -273,9 +275,9 @@ pub unsafe fn worker_setup(
         total_procs.saturating_sub(1)
     );
 
-    // M2.d: build the worker's MppMesh. Inbound drains pull frames from each
-    // peer proc's `slot(peer_proc, this_proc)` queue; per-(stage_id, partition)
-    // sub-buffers (M2.b) demux frames into the right consumer fragment.
+    // Build the worker's MppMesh. Inbound drains pull frames from each
+    // peer proc's `slot(peer_proc, this_proc)` queue, and per-(stage_id,
+    // partition) sub-buffers demux them into the right consumer fragment.
     let mut inbound_drains: Vec<Option<Arc<DrainHandle>>> =
         (0..total_procs).map(|_| None).collect();
     for (peer_idx, shm_recv) in attach.inbound_receivers.into_iter().enumerate() {
@@ -285,14 +287,16 @@ pub unsafe fn worker_setup(
         inbound_drains[sender_proc as usize] =
             Some(Arc::new(DrainHandle::cooperative(vec![mpp_recv])));
     }
-    // M2.d.3: install a self-loop in-proc channel for `slot(this_proc, this_proc)`.
-    // Peer-mesh hash routing can land producer-side and consumer-side tasks
-    // for the same `(stage, partition)` on the same worker, in which case the
-    // shm_mq grid's unattached diagonal would surface as "outbound_senders[this_proc]
-    // is None". The in-proc channel keeps frame routing uniform from the
-    // dispatcher's perspective: senders push, the DrainHandle reads via the
-    // same `BatchChannelReceiver` contract as shm_mq, and the M2.b sub-buffer
-    // registry demuxes per `(stage_id, partition)`.
+    // Install a self-loop in-proc channel for
+    // `slot(this_proc, this_proc)`. Peer-mesh hash routing can land
+    // producer-side and consumer-side tasks for the same
+    // `(stage, partition)` on the same worker. Without this, the shm_mq
+    // grid's unattached diagonal would surface as
+    // `outbound_senders[this_proc] = None`. The in-proc channel keeps
+    // frame routing uniform from the dispatcher's perspective: senders
+    // push, the `DrainHandle` reads via the same `BatchChannelReceiver`
+    // contract as shm_mq, and the sub-buffer registry demuxes per
+    // `(stage_id, partition)`.
     let (self_tx, self_rx) = in_proc_channel(SELF_LOOP_CAPACITY);
     let self_tx_arc: Arc<dyn BatchChannelSender> = Arc::new(self_tx);
     outbound_senders[proc_idx as usize] = Some(MppSender::with_header(

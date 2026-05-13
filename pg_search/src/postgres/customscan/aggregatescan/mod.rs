@@ -1094,14 +1094,15 @@ impl AggregateScan {
             .with_distributed_worker_transport(ShmMqWorkerTransport::new(mesh))
             .with_distributed_in_process_mode(true)
             .expect("with_distributed_in_process_mode")
-            // Estimator chain — order matters. The DF-D fork tries each
+            // Estimator chain order matters. The DF-D fork tries each
             // estimator in registration order until one returns Some.
-            // The build-side one-task estimator must come first; otherwise
-            // the default `Desired(n_workers)` leaf estimator wins and the
-            // all-gather memory leaf gets task_count = n_workers, which
-            // makes `_distribute_plan` build NetworkBroadcastExec with
-            // input_task_count = n_workers and the consumer's select_all
-            // over-counts by n_workers. See task_estimator.rs.
+            // The build-side one-task estimator has to come first.
+            // Otherwise the default `Desired(n_workers)` leaf estimator
+            // wins, the all-gather memory leaf gets task_count =
+            // n_workers, `_distribute_plan` builds
+            // `NetworkBroadcastExec` with `input_task_count = n_workers`,
+            // and the consumer's `select_all` over-counts by n_workers.
+            // See task_estimator.rs.
             .with_distributed_task_estimator(BroadcastBuildSideOneTaskEstimator)
             .with_distributed_task_estimator(n_workers)
             .with_distributed_broadcast_joins(true)
@@ -1133,12 +1134,11 @@ impl AggregateScan {
         let custom_exprs = df_state.custom_exprs;
         let custom_scan_tlist = df_state.custom_scan_tlist;
         let ctx = if mpp_is_active() {
-            // Drain-less stub mesh: `with_distributed_planner` only reads
-            // `n_procs` for stage sizing; `ShmMqWorkerTransport::open()` is
-            // execution-time only and never runs during EXPLAIN. After
-            // M1.c+d reshaped `MppMesh` to `{this_proc, n_procs,
-            // inbound_drains}`, the constructor is the only safe way to
-            // build one outside `glue::leader_setup`.
+            // Drain-less stub mesh. `with_distributed_planner` only needs
+            // `n_procs` for stage sizing, and `ShmMqWorkerTransport::open()`
+            // doesn't run during EXPLAIN. Going through the constructor
+            // is the only safe way to build an `MppMesh` outside
+            // `glue::leader_setup`.
             let stub_mesh = Arc::new(MppMesh::new(0, mpp_worker_count(), Vec::new()));
             Self::build_mpp_leader_session_context(stub_mesh)
         } else {
@@ -1236,16 +1236,15 @@ impl AggregateScan {
         };
         let plan_bytes = worker.plan_bytes.clone();
         // Worker count from the participant config (matches the leader's
-        // mesh.n_workers). `outbound_senders.len()` gives partitions-per-
-        // producer (= mpp_n_partitions), not the worker count — using it as
-        // n_workers misconfigured the planner so NetworkShuffleExec scaled
-        // its hash to mpp_n_partitions × mpp_n_partitions = 81 partitions.
+        // mesh.n_workers). Don't use `outbound_senders.len()` here. That's
+        // partitions-per-producer (mpp_n_partitions), and using it as
+        // n_workers makes NetworkShuffleExec scale its hash to
+        // mpp_n_partitions × mpp_n_partitions = 81 partitions.
         let n_workers = worker.participant_config.total_workers;
-        // M2.d.3: capture the worker's mesh + total proc count for the
-        // dispatcher. The mesh's inbound drains were attached in
-        // `worker_setup`; here we wire its `ShmMqWorkerTransport` into the
-        // session and install the plan-driven assignment table once the
-        // physical plan is built.
+        // Capture the worker's mesh + total proc count for the dispatcher.
+        // Inbound drains were attached in `worker_setup`; here we wire the
+        // mesh's `ShmMqWorkerTransport` into the session and install the
+        // plan-driven assignment table once the physical plan is built.
         let worker_mesh = Arc::clone(&worker.mesh);
         let this_proc = worker.mesh.this_proc;
         let total_procs = worker.mesh.n_procs;
@@ -1314,20 +1313,20 @@ impl AggregateScan {
             .with_default_features()
             .with_config(cfg)
             .with_distributed_worker_resolver(MppWorkerResolver::new(n_workers_us))
-            // M2.d.3: route nested boundaries through the worker's
-            // `MppMesh` via `ShmMqWorkerTransport`. Workers running a
-            // consumer-side fragment (e.g. `FinalPartitioned` above a
+            // Route nested boundaries through the worker's `MppMesh` via
+            // `ShmMqWorkerTransport`. Workers running a consumer-side
+            // fragment (e.g. `FinalPartitioned` above a
             // `NetworkShuffleExec` peer-mesh) call `WorkerTransport::open`
-            // here; the returned `ShmMqWorkerConnection` pulls from the
-            // worker's inbound drain for the producer's proc, demuxing on
-            // `(stage_id, partition)` via the M2.b sub-buffer registry.
+            // here. The returned `ShmMqWorkerConnection` pulls from the
+            // worker's inbound drain for the producer's proc and demuxes
+            // on `(stage_id, partition)` via the sub-buffer registry.
             //
-            // The earlier `LocalExecWorkerTransport` "re-execute the
-            // boundary's input subtree locally" path is gone: the producer
-            // task is hosted on a specific peer proc (per
-            // `proc_for_task`), and re-executing locally would duplicate
-            // work and break correctness for hash-partitioned shuffles
-            // (each worker would see all rows instead of its hash slice).
+            // The old `LocalExecWorkerTransport` path that re-ran the
+            // boundary's input subtree locally is gone. The producer task
+            // is hosted on a specific peer proc (per `proc_for_task`), so
+            // re-running locally would duplicate work, and for
+            // hash-partitioned shuffles it would break correctness too:
+            // each worker would see all rows instead of its hash slice.
             .with_distributed_worker_transport(ShmMqWorkerTransport::new(Arc::clone(&worker_mesh)))
             .with_distributed_in_process_mode(true)
             .expect("with_distributed_in_process_mode")
@@ -1423,7 +1422,7 @@ impl AggregateScan {
                     );
                     // Attach the worker mesh as the cooperative drain so a
                     // full outbound shm_mq queue doesn't block the backend
-                    // thread — the spin pulls every inbound drain while
+                    // thread. The spin pulls every inbound drain while
                     // retrying the send, breaking N×N symmetric stalls.
                     per_partition_senders.push(
                         base.clone_with_header(MppFrameHeader::batch(fragment.stage_id, q_u32))
@@ -1433,23 +1432,24 @@ impl AggregateScan {
                     );
                 }
 
-                // Broadcast invariant — fail-loud cap check:
+                // Broadcast invariant: fail-loud cap check.
+                //
                 // pg_search's natural-shape AggregateScan plan canonical-
-                // replicates the build subtree via the `mpp build all-
-                // gather` step, so every producer task would scan the
-                // full canonical data and the consumer's `select_all`
-                // would over-count by `input_task_count`. The planner-
-                // level [`BroadcastBuildSideOneTaskEstimator`] caps the
-                // build subtree at task_count=1, so a correct plan
-                // produces exactly one Broadcast fragment with
+                // replicates the build subtree via the `mpp build
+                // all-gather` step. Every producer task would scan the
+                // full canonical data, and the consumer's `select_all`
+                // would over-count by `input_task_count`. The
+                // planner-level [`BroadcastBuildSideOneTaskEstimator`]
+                // caps the build subtree at task_count=1, so a correct
+                // plan produces exactly one Broadcast fragment with
                 // task_idx == 0.
                 //
                 // A non-zero `task_idx` here means the cap silently
-                // failed — either the estimator wasn't installed, the
+                // failed: maybe the estimator wasn't installed, the
                 // chain order is wrong, or a future planner pass
                 // re-expanded the build subtree. We surface this as a
                 // hard error rather than silently EOF-only-ing the
-                // fragment: the EOF-only fallback is only correct under
+                // fragment. The EOF-only fallback is only correct under
                 // the canonical-replica INVARIANT documented on
                 // `FragmentRouting::Broadcast`, and we'd rather fail
                 // loudly than emit a stealth correctness regression.
@@ -1466,7 +1466,7 @@ impl AggregateScan {
                     if fragment.task_idx != 0 {
                         return Err(datafusion::common::DataFusionError::Internal(format!(
                             "mpp worker dispatch (proc={this_proc}): Broadcast fragment \
-                             (stage_id={}, task_idx={}) with task_idx > 0 — the planner-level \
+                             (stage_id={}, task_idx={}) with task_idx > 0. The planner-level \
                              BroadcastBuildSideOneTaskEstimator should cap input_task_count at \
                              1. A non-zero task_idx here indicates plan-walk drift or a missing \
                              estimator chain on this session; running the producer plan would \
@@ -1541,11 +1541,11 @@ impl AggregateScan {
                 "mpp worker dispatch this_proc={this_proc} starting try_join_all on {} fragments",
                 fragments.len()
             );
-            // Deadlock detector: under `paradedb.mpp_debug`, if no fragment
-            // completes within 30s we treat it as a hang and surface as an
-            // error rather than letting the backend spin indefinitely.
-            // Per-drain state is logged via the inbound drains' own traces
-            // (M2.b/M2.d logging in transport.rs / runtime.rs).
+            // Deadlock detector. Under `paradedb.mpp_debug`, if no
+            // fragment completes within 30s we treat it as a hang and
+            // surface an error instead of letting the backend spin
+            // forever. Per-drain state shows up in the inbound drains'
+            // own traces in transport.rs / runtime.rs.
             let join_fut = futures::future::try_join_all(futures);
             let outcome = if crate::gucs::mpp_debug() {
                 match tokio::time::timeout(std::time::Duration::from_secs(30), join_fut).await {
@@ -1556,7 +1556,7 @@ impl AggregateScan {
                              HANG: try_join_all exceeded 30s"
                         );
                         Err(datafusion::common::DataFusionError::Internal(format!(
-                            "mpp worker dispatch (proc={this_proc}): try_join_all exceeded 30s — \
+                            "mpp worker dispatch (proc={this_proc}): try_join_all exceeded 30s; \
                              deadlock detector triggered"
                         )))
                     }
@@ -2035,14 +2035,14 @@ impl AggregateScan {
                 unsafe { pg_sys::work_mem as usize * 1024 },
                 unsafe { pg_sys::hash_mem_multiplier },
             );
-            // M2.d review-fix: explicitly install `DistributedTaskContext` on
-            // the leader's task_ctx. The fork's `from_ctx` defaults to
-            // `{task_index: 0, task_count: 1}` which arithmetically matches
-            // our current single-leader natural-shape gather, but the
-            // implicit fallback silently masks any planner shape that emits
-            // a different `consumer_tc` at the top boundary. Installing it
-            // up-front makes the contract explicit and aligns with the
-            // worker dispatcher's `DistributedTaskContext` setup.
+            // Install `DistributedTaskContext` explicitly on the leader's
+            // task_ctx. The fork's `from_ctx` would default to
+            // `{task_index: 0, task_count: 1}`, which happens to be right
+            // for the current single-leader natural-shape gather. But the
+            // implicit fallback silently hides any planner shape that
+            // emits a different `consumer_tc` at the top boundary. Setting
+            // it up-front makes the contract explicit and matches what the
+            // worker dispatcher does.
             let task_ctx = {
                 let cfg = task_ctx.session_config().clone().with_extension(Arc::new(
                     DistributedTaskContext {

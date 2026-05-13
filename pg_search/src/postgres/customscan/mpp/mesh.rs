@@ -55,11 +55,12 @@ pub fn align_up_maxalign_checked(n: usize) -> Option<usize> {
 /// shm_mq-backed `BatchChannelSender`. Wraps `MessageQueueSender` so we reuse
 /// its detach-on-drop behavior and the pgrx-safe FFI.
 ///
-/// `unsafe impl Send` below is safe **only** when the sender is *used* from
-/// a thread that owns a valid `PGPROC` — i.e., the main backend thread or a
-/// dedicated parallel-worker backend. The blocking `shm_mq_send(nowait=false)`
-/// path uses `WaitLatch` + `CHECK_FOR_INTERRUPTS` — both process-global
-/// Postgres primitives, not thread-safe off a backend thread.
+/// `unsafe impl Send` below is safe **only** when the sender is *used*
+/// from a thread that owns a valid `PGPROC` (the main backend thread or
+/// a dedicated parallel-worker backend). The blocking
+/// `shm_mq_send(nowait=false)` path uses `WaitLatch` +
+/// `CHECK_FOR_INTERRUPTS`, both process-global Postgres primitives that
+/// aren't thread-safe off a backend thread.
 pub struct ShmMqSender {
     inner: MessageQueueSender,
     attach_thread: std::thread::ThreadId,
@@ -68,12 +69,12 @@ pub struct ShmMqSender {
 // SAFETY: see struct doc.
 unsafe impl Send for ShmMqSender {}
 // SAFETY: `MppSender` ensures all `send_*` paths execute on the attach
-// thread (a `debug_assert!` in `send_bytes` / `try_send_bytes` pins this),
-// so cross-thread sharing of `&ShmMqSender` never actually crosses threads
-// at the FFI boundary. The Sync bound exists so multiple `MppSender`s can
-// hold `Arc<dyn BatchChannelSender>` clones of the same underlying queue
-// — the M2 multi-partition fan-out pattern — without the type system
-// rejecting the `Arc::clone` at compile time.
+// thread (a `debug_assert!` in `send_bytes` / `try_send_bytes` pins
+// this), so cross-thread sharing of `&ShmMqSender` never actually
+// crosses threads at the FFI boundary. The Sync bound is there so
+// multiple `MppSender`s can hold `Arc<dyn BatchChannelSender>` clones of
+// the same underlying queue (the multi-partition fan-out pattern)
+// without the type system rejecting the `Arc::clone` at compile time.
 unsafe impl Sync for ShmMqSender {}
 
 impl ShmMqSender {

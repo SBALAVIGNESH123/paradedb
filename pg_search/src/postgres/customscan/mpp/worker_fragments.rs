@@ -122,7 +122,7 @@ pub enum FragmentRouting {
     /// build subtree and makes the DF-D planner build
     /// `NetworkBroadcastExec` with `input_task_count = 1`. With the cap
     /// in place the dispatcher only ever sees `task_idx == 0` fragments
-    /// for Broadcast routing — the wire-layer guard is a hard
+    /// for Broadcast routing. The wire-layer guard is a hard
     /// `pgrx::error!` for any `task_idx > 0` so a missed cap surfaces
     /// loudly instead of silently mis-routing data.
     ///
@@ -216,21 +216,21 @@ fn collect(
         //
         // NetworkShuffleExec and NetworkBroadcastExec have IDENTICAL
         // receive-side math: both compute `off = P_c * task_index` and
-        // pull partition `off + p_local` from every input task. The
-        // producer-side routing must therefore also be the same — output
-        // partition q goes to consumer task `q / P_c`. The semantic
-        // difference (shuffle hashes rows, broadcast emits the full set
-        // to every consumer) lives entirely inside each task's plan and
-        // doesn't change how partitions map to procs at the wire layer.
+        // pull partition `off + p_local` from every input task. So the
+        // producer-side routing has to match: output partition q goes
+        // to consumer task `q / P_c`. The semantic difference (shuffle
+        // hashes rows, broadcast emits the full set to every consumer)
+        // lives entirely inside each task's plan and doesn't change how
+        // partitions map to procs at the wire layer.
         //
-        // NetworkCoalesceExec is different: its execute consults a single
+        // NetworkCoalesceExec is different. Its execute consults a single
         // input task per consumer (`target_task = group.start_task +
-        // input_task_offset`) and the producer emits one stream per
-        // consumer task in its group. For the natural-shape plan we
-        // currently target the only nested coalesce is consumer_tc=1 (the
-        // top-level gather, handled by the `parent=None` arm), so the
-        // nested-coalesce arm here is a defensive fallback for shapes the
-        // M2.d milestone doesn't yet exercise.
+        // input_task_offset`), and the producer emits one stream per
+        // consumer task in its group. In the natural-shape plan we
+        // currently target, the only nested coalesce is consumer_tc=1
+        // (the top-level gather, handled by the `parent=None` arm). The
+        // nested-coalesce arm below is a defensive fallback for shapes we
+        // don't exercise yet.
         let routing = match (name, nested) {
             // Top-level NetworkBroadcastExec is not a shape the natural-
             // shape AggregateScan plan produces today (broadcast is always
@@ -307,9 +307,9 @@ fn collect(
                 }
             }
             // Recurse into the stage's plan with `nested = true`. The
-            // boundary's `children()` returns `[stage.plan]` so descending
-            // through it would double-process every nested fragment —
-            // return here to keep visit counts exact.
+            // boundary's `children()` returns `[stage.plan]`, so
+            // descending through it would double-process every nested
+            // fragment. Return here to keep visit counts exact.
             collect(stage_plan, this_proc, n_workers, true, out);
         }
         return;

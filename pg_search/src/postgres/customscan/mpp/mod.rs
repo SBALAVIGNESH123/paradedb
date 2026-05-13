@@ -21,9 +21,10 @@
 //! workers through PostgreSQL `shm_mq` queues, so each row is scanned exactly once.
 //! Guarded by `paradedb.enable_mpp` (default off).
 //!
-//! Transport deadlock-avoidance relies on one dedicated drain thread per participant
-//! that reads all inbound queues into a spillable local buffer — this decouples
-//! consumer-side backpressure from producer-side backpressure.
+//! Transport deadlock-avoidance relies on one dedicated drain thread
+//! per participant that reads all inbound queues into a spillable local
+//! buffer. That decouples consumer-side backpressure from producer-side
+//! backpressure.
 
 pub mod dsm;
 pub mod glue;
@@ -40,13 +41,13 @@ use serde::{Deserialize, Serialize};
 /// [`glue::MppLeaderState`] / [`glue::MppWorkerState`] so the AggregateScan
 /// worker path can size the in-process planner via `total_workers`.
 /// The DF-D fork's `WorkerResolver` derives task identity from its own indexing,
-/// so this is a diagnostic / sizing hand-off — not a `SessionConfig`
+/// so this is a diagnostic / sizing hand-off, not a `SessionConfig`
 /// extension.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MppParticipantConfig {
-    /// 0-based worker index (`ParallelWorkerNumber`). Workers only — the
-    /// leader has no `MppParticipantConfig` since it doesn't run a worker
-    /// fragment in the single-stage gather path.
+    /// 0-based worker index (`ParallelWorkerNumber`). Workers only. The
+    /// leader has no `MppParticipantConfig` since it doesn't run a
+    /// worker fragment in the single-stage gather path.
     pub participant_index: u32,
     /// Number of producer workers in the mesh (= `n_procs - 1`; the leader
     /// is consumer-only in the single-stage gather path).
